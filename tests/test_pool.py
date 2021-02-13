@@ -10,7 +10,6 @@ import inspect
 import os
 import platform
 import random
-import sys
 import textwrap
 import time
 import unittest
