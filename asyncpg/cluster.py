@@ -377,10 +377,11 @@ class Cluster:
                 'cannot modify HBA records: {}'.format(e)) from e
 
     def add_hba_entry(self, *,
-                      database: str, user: str,
-                      auth_method: str,
                       type: str = 'host',
+                      database: str,
+                      user: str,
                       address: typing.Optional[str] = None,
+                      auth_method: str,
                       auth_options: typing.Optional[
                           typing.Dict[str, str]] = None) -> None:
         """Add a record to pg_hba.conf."""
@@ -738,10 +739,11 @@ class RunningCluster(Cluster):
         raise ClusterError('cannot modify HBA records of unmanaged cluster')
 
     def add_hba_entry(self, *,
-                      database: str, user: str,
-                      auth_method: str,
                       type: str = 'host',
+                      database: str,
+                      user: str,
                       address: typing.Optional[str] = None,
+                      auth_method: str,
                       auth_options: typing.Optional[
                           typing.Dict[str, str]] = None) -> None:
         raise ClusterError('cannot modify HBA records of unmanaged cluster')

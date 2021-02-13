@@ -720,7 +720,6 @@ class TestPool(tb.ConnectedTestCase):
 
         await pool.close()
 
-    @unittest.skipIf(sys.version_info[:2] < (3, 6), 'no asyncgen support')
     async def test_pool_handles_transaction_exit_in_asyncgen_1(self):
         pool = await self.create_pool(database='postgres',
                                       min_size=1, max_size=1)
@@ -742,7 +741,6 @@ class TestPool(tb.ConnectedTestCase):
                 async for _ in iterate(con):  # noqa
                     raise MyException()
 
-    @unittest.skipIf(sys.version_info[:2] < (3, 6), 'no asyncgen support')
     async def test_pool_handles_transaction_exit_in_asyncgen_2(self):
         pool = await self.create_pool(database='postgres',
                                       min_size=1, max_size=1)
@@ -767,7 +765,6 @@ class TestPool(tb.ConnectedTestCase):
 
             del iterator
 
-    @unittest.skipIf(sys.version_info[:2] < (3, 6), 'no asyncgen support')
     async def test_pool_handles_asyncgen_finalization(self):
         pool = await self.create_pool(database='postgres',
                                       min_size=1, max_size=1)
