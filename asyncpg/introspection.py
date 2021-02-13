@@ -5,7 +5,15 @@
 # the Apache 2.0 License: http://www.apache.org/licenses/LICENSE-2.0
 
 
-_TYPEINFO = '''\
+import typing
+
+from . import compat
+
+if typing.TYPE_CHECKING:
+    from . import protocol
+
+
+_TYPEINFO: compat.Final = '''\
     (
         SELECT
             t.oid                           AS oid,
@@ -82,7 +90,7 @@ _TYPEINFO = '''\
 '''
 
 
-INTRO_LOOKUP_TYPES = '''\
+INTRO_LOOKUP_TYPES: compat.Final = '''\
 WITH RECURSIVE typeinfo_tree(
     oid, ns, name, kind, basetype, elemtype, elemdelim,
     range_subtype, attrtypoids, attrnames, depth)
@@ -123,7 +131,7 @@ ORDER BY
 '''.format(typeinfo=_TYPEINFO)
 
 
-TYPE_BY_NAME = '''\
+TYPE_BY_NAME: compat.Final = '''\
 SELECT
     t.oid,
     t.typelem     AS elemtype,
@@ -136,7 +144,7 @@ WHERE
 '''
 
 
-TYPE_BY_OID = '''\
+TYPE_BY_OID: compat.Final = '''\
 SELECT
     t.oid,
     t.typelem     AS elemtype,
@@ -149,15 +157,15 @@ WHERE
 
 
 # 'b' for a base type, 'd' for a domain, 'e' for enum.
-SCALAR_TYPE_KINDS = (b'b', b'd', b'e')
+SCALAR_TYPE_KINDS: compat.Final = (b'b', b'd', b'e')
 
 
-def is_scalar_type(typeinfo) -> bool:
+def is_scalar_type(typeinfo: 'protocol.Record') -> bool:
     return (
         typeinfo['kind'] in SCALAR_TYPE_KINDS and
         not typeinfo['elemtype']
     )
 
 
-def is_domain_type(typeinfo) -> bool:
-    return typeinfo['kind'] == b'd'
+def is_domain_type(typeinfo: 'protocol.Record') -> bool:
+    return typing.cast(bool, typeinfo['kind'] == b'd')

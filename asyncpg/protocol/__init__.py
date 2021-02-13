@@ -6,4 +6,4 @@
 
 # flake8: NOQA
 
-from .protocol import Protocol, Record, NO_TIMEOUT, BUILTIN_TYPE_NAME_MAP
+from .protocol import Protocol as Protocol, Record as Record, NO_TIMEOUT as NO_TIMEOUT, BUILTIN_TYPE_NAME_MAP as BUILTIN_TYPE_NAME_MAP  # NOQA

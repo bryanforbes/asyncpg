@@ -6,13 +6,24 @@
 
 
 import collections
+import typing
 
-from . import compat
 from . import connresource
 from . import exceptions
 
 
-class CursorFactory(connresource.ConnectionResource):
+if typing.TYPE_CHECKING:
+    from .protocol import protocol as _cprotocol
+    from . import connection as _connection
+
+
+_Cursor = typing.TypeVar('_Cursor', bound='Cursor[typing.Any]')
+_CursorIterator = typing.TypeVar('_CursorIterator',
+                                 bound='CursorIterator[typing.Any]')
+_Record = typing.TypeVar('_Record', bound='_cprotocol.Record')
+
+
+class CursorFactory(connresource.ConnectionResource, typing.Generic[_Record]):
     """A cursor interface for the results of a query.
 
     A cursor interface can be used to initiate efficient traversal of the
@@ -28,16 +39,42 @@ class CursorFactory(connresource.ConnectionResource):
         '_record_class',
     )
 
+    @typing.overload
+    def __init__(
+        self: 'CursorFactory[_Record]',
+        connection: '_connection.Connection[_Record]',
+        query: str,
+        state: 'typing.Optional[_cprotocol.PreparedStatementState[_Record]]',
+        args: typing.Sequence[typing.Any],
+        prefetch: typing.Optional[int],
+        timeout: typing.Optional[float],
+        record_class: None
+    ) -> None:
+        ...
+
+    @typing.overload
+    def __init__(
+        self: 'CursorFactory[_Record]',
+        connection: '_connection.Connection[typing.Any]',
+        query: str,
+        state: 'typing.Optional[_cprotocol.PreparedStatementState[_Record]]',
+        args: typing.Sequence[typing.Any],
+        prefetch: typing.Optional[int],
+        timeout: typing.Optional[float],
+        record_class: typing.Type[_Record]
+    ) -> None:
+        ...
+
     def __init__(
         self,
-        connection,
-        query,
-        state,
-        args,
-        prefetch,
-        timeout,
-        record_class
-    ):
+        connection: '_connection.Connection[typing.Any]',
+        query: str,
+        state: 'typing.Optional[_cprotocol.PreparedStatementState[_Record]]',
+        args: typing.Sequence[typing.Any],
+        prefetch: typing.Optional[int],
+        timeout: typing.Optional[float],
+        record_class: typing.Optional[typing.Type[_Record]]
+    ) -> None:
         super().__init__(connection)
         self._args = args
         self._prefetch = prefetch
@@ -48,9 +85,8 @@ class CursorFactory(connresource.ConnectionResource):
         if state is not None:
             state.attach()
 
-    @compat.aiter_compat
     @connresource.guarded
-    def __aiter__(self):
+    def __aiter__(self) -> 'CursorIterator[_Record]':
         prefetch = 50 if self._prefetch is None else self._prefetch
         return CursorIterator(
             self._connection,
@@ -63,11 +99,12 @@ class CursorFactory(connresource.ConnectionResource):
         )
 
     @connresource.guarded
-    def __await__(self):
+    def __await__(self) -> typing.Generator[
+            typing.Any, None, 'Cursor[_Record]']:
         if self._prefetch is not None:
             raise exceptions.InterfaceError(
                 'prefetch argument can only be specified for iterable cursor')
-        cursor = Cursor(
+        cursor: Cursor[_Record] = Cursor(
             self._connection,
             self._query,
             self._state,
@@ -76,13 +113,13 @@ class CursorFactory(connresource.ConnectionResource):
         )
         return cursor._init(self._timeout).__await__()
 
-    def __del__(self):
+    def __del__(self) -> None:
         if self._state is not None:
             self._state.detach()
             self._connection._maybe_gc_stmt(self._state)
 
 
-class BaseCursor(connresource.ConnectionResource):
+class BaseCursor(connresource.ConnectionResource, typing.Generic[_Record]):
 
     __slots__ = (
         '_state',
@@ -93,18 +130,47 @@ class BaseCursor(connresource.ConnectionResource):
         '_record_class',
     )
 
-    def __init__(self, connection, query, state, args, record_class):
+    @typing.overload
+    def __init__(
+        self: 'BaseCursor[_Record]',
+        connection: '_connection.Connection[_Record]',
+        query: str,
+        state: 'typing.Optional[_cprotocol.PreparedStatementState[_Record]]',
+        args: typing.Sequence[typing.Any],
+        record_class: None
+    ) -> None:
+        ...
+
+    @typing.overload
+    def __init__(
+        self: 'BaseCursor[_Record]',
+        connection: '_connection.Connection[typing.Any]',
+        query: str,
+        state: 'typing.Optional[_cprotocol.PreparedStatementState[_Record]]',
+        args: typing.Sequence[typing.Any],
+        record_class: typing.Type[_Record]
+    ) -> None:
+        ...
+
+    def __init__(
+        self,
+        connection: '_connection.Connection[typing.Any]',
+        query: str,
+        state: 'typing.Optional[_cprotocol.PreparedStatementState[_Record]]',
+        args: typing.Sequence[typing.Any],
+        record_class: typing.Optional[typing.Type[_Record]]
+    ) -> None:
         super().__init__(connection)
         self._args = args
         self._state = state
         if state is not None:
             state.attach()
-        self._portal_name = None
+        self._portal_name: typing.Optional[str] = None
         self._exhausted = False
         self._query = query
         self._record_class = record_class
 
-    def _check_ready(self):
+    def _check_ready(self) -> None:
         if self._state is None:
             raise exceptions.InterfaceError(
                 'cursor: no associated prepared statement')
@@ -117,7 +183,8 @@ class BaseCursor(connresource.ConnectionResource):
             raise exceptions.NoActiveSQLTransactionError(
                 'cursor cannot be created outside of a transaction')
 
-    async def _bind_exec(self, n, timeout):
+    async def _bind_exec(self, n: int,
+                         timeout: typing.Optional[float]) -> typing.Any:
         self._check_ready()
 
         if self._portal_name:
@@ -128,11 +195,14 @@ class BaseCursor(connresource.ConnectionResource):
         protocol = con._protocol
 
         self._portal_name = con._get_unique_id('portal')
+
+        assert self._state is not None
+
         buffer, _, self._exhausted = await protocol.bind_execute(
             self._state, self._args, self._portal_name, n, True, timeout)
         return buffer
 
-    async def _bind(self, timeout):
+    async def _bind(self, timeout: typing.Optional[float]) -> typing.Any:
         self._check_ready()
 
         if self._portal_name:
@@ -143,12 +213,16 @@ class BaseCursor(connresource.ConnectionResource):
         protocol = con._protocol
 
         self._portal_name = con._get_unique_id('portal')
+
+        assert self._state is not None
+
         buffer = await protocol.bind(self._state, self._args,
                                      self._portal_name,
                                      timeout)
         return buffer
 
-    async def _exec(self, n, timeout):
+    async def _exec(self, n: int,
+                    timeout: typing.Optional[float]) -> typing.Any:
         self._check_ready()
 
         if not self._portal_name:
@@ -160,7 +234,7 @@ class BaseCursor(connresource.ConnectionResource):
             self._state, self._portal_name, n, True, timeout)
         return buffer
 
-    def __repr__(self):
+    def __repr__(self) -> str:
         attrs = []
         if self._exhausted:
             attrs.append('exhausted')
@@ -173,46 +247,71 @@ class BaseCursor(connresource.ConnectionResource):
 
         return '<{}.{} "{!s:.30}" {}{:#x}>'.format(
             mod, self.__class__.__name__,
-            self._state.query,
+            self._state.query if self._state is not None else '',
             ' '.join(attrs), id(self))
 
-    def __del__(self):
+    def __del__(self) -> None:
         if self._state is not None:
             self._state.detach()
             self._connection._maybe_gc_stmt(self._state)
 
 
-class CursorIterator(BaseCursor):
+class CursorIterator(BaseCursor[_Record]):
 
     __slots__ = ('_buffer', '_prefetch', '_timeout')
 
+    @typing.overload
+    def __init__(
+        self: 'CursorIterator[_Record]',
+        connection: '_connection.Connection[_Record]',
+        query: str,
+        state: 'typing.Optional[_cprotocol.PreparedStatementState[_Record]]',
+        args: typing.Sequence[typing.Any],
+        record_class: None,
+        prefetch: int,
+        timeout: typing.Optional[float]
+    ) -> None:
+        ...
+
+    @typing.overload
+    def __init__(
+        self: 'CursorIterator[_Record]',
+        connection: '_connection.Connection[typing.Any]',
+        query: str,
+        state: 'typing.Optional[_cprotocol.PreparedStatementState[_Record]]',
+        args: typing.Sequence[typing.Any],
+        record_class: typing.Type[_Record],
+        prefetch: int,
+        timeout: typing.Optional[float]
+    ) -> None:
+        ...
+
     def __init__(
         self,
-        connection,
-        query,
-        state,
-        args,
-        record_class,
-        prefetch,
-        timeout
-    ):
+        connection: '_connection.Connection[typing.Any]',
+        query: str,
+        state: 'typing.Optional[_cprotocol.PreparedStatementState[_Record]]',
+        args: typing.Sequence[typing.Any],
+        record_class: typing.Optional[typing.Type[_Record]],
+        prefetch: int,
+        timeout: typing.Optional[float]
+    ) -> None:
         super().__init__(connection, query, state, args, record_class)
 
         if prefetch <= 0:
             raise exceptions.InterfaceError(
                 'prefetch argument must be greater than zero')
 
-        self._buffer = collections.deque()
+        self._buffer: typing.Deque[_Record] = collections.deque()
         self._prefetch = prefetch
         self._timeout = timeout
 
-    @compat.aiter_compat
     @connresource.guarded
-    def __aiter__(self):
+    def __aiter__(self: _CursorIterator) -> _CursorIterator:
         return self
 
     @connresource.guarded
-    async def __anext__(self):
+    async def __anext__(self) -> _Record:
         if self._state is None:
             self._state = await self._connection._get_statement(
                 self._query,
@@ -236,12 +335,12 @@ class CursorIterator(BaseCursor):
         raise StopAsyncIteration
 
 
-class Cursor(BaseCursor):
+class Cursor(BaseCursor[_Record]):
     """An open *portal* into the results of a query."""
 
     __slots__ = ()
 
-    async def _init(self, timeout):
+    async def _init(self: _Cursor, timeout: typing.Optional[float]) -> _Cursor:
         if self._state is None:
             self._state = await self._connection._get_statement(
                 self._query,
@@ -255,7 +354,9 @@ class Cursor(BaseCursor):
         return self
 
     @connresource.guarded
-    async def fetch(self, n, *, timeout=None):
+    async def fetch(self, n: int, *,
+                    timeout: typing.Optional[float] = None) \
+            -> typing.List[_Record]:
         r"""Return the next *n* rows as a list of :class:`Record` objects.
 
         :param float timeout: Optional timeout value in seconds.
@@ -267,13 +368,16 @@ class Cursor(BaseCursor):
             raise exceptions.InterfaceError('n must be greater than zero')
         if self._exhausted:
             return []
-        recs = await self._exec(n, timeout)
+        recs: typing.List[_Record] = await self._exec(n, timeout)
         if len(recs) < n:
             self._exhausted = True
         return recs
 
     @connresource.guarded
-    async def fetchrow(self, *, timeout=None):
+    async def fetchrow(
+        self, *,
+        timeout: typing.Optional[float] = None
+    ) -> typing.Optional[_Record]:
         r"""Return the next row.
 
         :param float timeout: Optional timeout value in seconds.
@@ -283,14 +387,15 @@ class Cursor(BaseCursor):
         self._check_ready()
         if self._exhausted:
             return None
-        recs = await self._exec(1, timeout)
+        recs: typing.List[_Record] = await self._exec(1, timeout)
         if len(recs) < 1:
             self._exhausted = True
             return None
         return recs[0]
 
     @connresource.guarded
-    async def forward(self, n, *, timeout=None) -> int:
+    async def forward(self, n: int, *,
+                      timeout: typing.Optional[float] = None) -> int:
         r"""Skip over the next *n* rows.
 
         :param float timeout: Optional timeout value in seconds.

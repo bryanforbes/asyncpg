@@ -10,9 +10,11 @@ import asyncpg
 import collections
 import collections.abc
 import itertools
+import os
 import sys
 import time
 import traceback
+import typing
 import warnings
 
 from . import compat
@@ -26,15 +28,99 @@ from . import serverversion
 from . import transaction
 from . import utils
 
+if typing.TYPE_CHECKING:
+    import _typeshed
+    from .protocol import protocol as _cprotocol
+    from . import pool as _pool
+    from . import types
 
-class ConnectionMeta(type):
 
-    def __instancecheck__(cls, instance):
+_Connection = typing.TypeVar('_Connection', bound='Connection[typing.Any]')
+_Writer = typing.Callable[[bytes],
+                          typing.Coroutine[typing.Any, typing.Any, None]]
+_Record = typing.TypeVar('_Record', bound=protocol.Record)
+_OtherRecord = typing.TypeVar('_OtherRecord', bound=protocol.Record)
+_RecordsType = typing.List[_Record]
+_RecordsExtraType = typing.Tuple[_RecordsType[_Record], bytes, bool]
+_AnyCallable = typing.Callable[..., typing.Any]
+
+OutputType = typing.Union['_typeshed.AnyPath',
+                          typing.BinaryIO,
+                          _Writer]
+SourceType = typing.Union['_typeshed.AnyPath',
+                          typing.BinaryIO,
+                          typing.AsyncIterable[bytes]]
+
+CopyFormat = compat.Literal['text', 'csv', 'binary']
+PasswordType = typing.Union[
+    str,
+    typing.Callable[[], str],
+    typing.Callable[[], typing.Coroutine[typing.Any, typing.Any, str]]
+]
+
+
+class Listener(compat.Protocol):
+    def __call__(self,
+                 __con_ref: typing.Union[
+                     'Connection[typing.Any]',
+                     '_pool.PoolConnectionProxy[typing.Any]'],
+                 __pid: int,
+                 __channel: str,
+                 __payload: typing.Any) -> None:
+        ...
+
+
+class LogListener(compat.Protocol):
+    def __call__(self,
+                 __con_ref: typing.Union[
+                     'Connection[typing.Any]',
+                     '_pool.PoolConnectionProxy[typing.Any]'],
+                 __message: exceptions.PostgresLogMessage) -> None:
+        ...
+
+
+class TerminationListener(compat.Protocol):
+    def __call__(self,
+                 __con_ref: typing.Union[
+                     'Connection[typing.Any]',
+                     '_pool.PoolConnectionProxy[typing.Any]']) -> None:
+        ...
+
+
+class OnRemove(compat.Protocol[_Record]):
+    def __call__(
+        self,
+        __statement: '_cprotocol.PreparedStatementState[_Record]'
+    ) -> None:
+        ...
+
+
+class Executor(compat.Protocol[_Record]):
+    def __call__(
+        self,
+        __statement: '_cprotocol.PreparedStatementState[_Record]',
+        __timeout: typing.Optional[float]
+    ) -> typing.Any:
+        ...
+
+
+class _ConnectionMeta(type):
+
+    def __instancecheck__(cls, instance: typing.Any) -> bool:
         mro = type(instance).__mro__
         return Connection in mro or _ConnectionProxy in mro
 
 
-class Connection(metaclass=ConnectionMeta):
+if sys.version_info >= (3, 7):
+    class ConnectionMeta(_ConnectionMeta):
+        ...
+else:
+    # see: https://github.com/python/typing/issues/449
+    class ConnectionMeta(_ConnectionMeta, typing.GenericMeta):
+        ...
+
+
+class Connection(typing.Generic[_Record], metaclass=ConnectionMeta):
     """A representation of a database session.
 
     Connections are created by calling :func:`~asyncpg.connection.connect`.
@@ -49,14 +135,16 @@ class Connection(metaclass=ConnectionMeta):
                  '_log_listeners', '_termination_listeners', '_cancellations',
                  '_source_traceback', '__weakref__')
 
-    def __init__(self, protocol, transport, loop,
-                 addr,
+    def __init__(self, protocol: '_cprotocol.BaseProtocol[_Record]',
+                 transport: typing.Any,
+                 loop: asyncio.AbstractEventLoop,
+                 addr: typing.Union[typing.Tuple[str, int], str],
                  config: connect_utils._ClientConfiguration,
-                 params: connect_utils._ConnectionParameters):
+                 params: connect_utils._ConnectionParameters) -> None:
         self._protocol = protocol
         self._transport = transport
         self._loop = loop
-        self._top_xact = None
+        self._top_xact: typing.Optional[transaction.Transaction] = None
         self._aborted = False
         # Incremented every time the connection is released back to a pool.
         # Used to catch invalid references to connection-related resources
@@ -73,12 +161,14 @@ class Connection(metaclass=ConnectionMeta):
             on_remove=self._maybe_gc_stmt,
             max_lifetime=config.max_cached_statement_lifetime)
 
-        self._stmts_to_close = set()
+        self._stmts_to_close: typing.Set[
+            '_cprotocol.PreparedStatementState[typing.Any]'
+        ] = set()
 
-        self._listeners = {}
-        self._log_listeners = set()
-        self._cancellations = set()
-        self._termination_listeners = set()
+        self._listeners: typing.Dict[str, typing.Set[Listener]] = {}
+        self._log_listeners: typing.Set[LogListener] = set()
+        self._cancellations: typing.Set[asyncio.Task[typing.Any]] = set()
+        self._termination_listeners: typing.Set[TerminationListener] = set()
 
         settings = self._protocol.get_settings()
         ver_string = settings.server_version
@@ -90,8 +180,10 @@ class Connection(metaclass=ConnectionMeta):
 
         self._intro_query = introspection.INTRO_LOOKUP_TYPES
 
-        self._reset_query = None
-        self._proxy = None
+        self._reset_query: typing.Optional[str] = None
+        self._proxy: typing.Optional[
+            '_pool.PoolConnectionProxy[typing.Any]'
+        ] = None
 
         # Used to serialize operations that might involve anonymous
         # statements.  Specifically, we want to make the following
@@ -103,11 +195,11 @@ class Connection(metaclass=ConnectionMeta):
         self._stmt_exclusive_section = _Atomic()
 
         if loop.get_debug():
-            self._source_traceback = _extract_stack()
+            self._source_traceback: typing.Optional[str] = _extract_stack()
         else:
             self._source_traceback = None
 
-    def __del__(self):
+    def __del__(self) -> None:
         if not self.is_closed() and self._protocol is not None:
             if self._source_traceback:
                 msg = "unclosed connection {!r}; created at:\n {}".format(
@@ -123,7 +215,7 @@ class Connection(metaclass=ConnectionMeta):
             if not self._loop.is_closed():
                 self.terminate()
 
-    async def add_listener(self, channel, callback):
+    async def add_listener(self, channel: str, callback: Listener) -> None:
         """Add a listener for Postgres notifications.
 
         :param str channel: Channel to listen on.
@@ -141,7 +233,7 @@ class Connection(metaclass=ConnectionMeta):
             self._listeners[channel] = set()
         self._listeners[channel].add(callback)
 
-    async def remove_listener(self, channel, callback):
+    async def remove_listener(self, channel: str, callback: Listener) -> None:
         """Remove a listening callback on the specified channel."""
         if self.is_closed():
             return
@@ -154,7 +246,7 @@ class Connection(metaclass=ConnectionMeta):
             del self._listeners[channel]
             await self.fetch('UNLISTEN {}'.format(utils._quote_ident(channel)))
 
-    def add_log_listener(self, callback):
+    def add_log_listener(self, callback: LogListener) -> None:
         """Add a listener for Postgres log messages.
 
         It will be called when asyncronous NoticeResponse is received
@@ -172,14 +264,14 @@ class Connection(metaclass=ConnectionMeta):
             raise exceptions.InterfaceError('connection is closed')
         self._log_listeners.add(callback)
 
-    def remove_log_listener(self, callback):
+    def remove_log_listener(self, callback: LogListener) -> None:
         """Remove a listening callback for log messages.
 
         .. versionadded:: 0.12.0
         """
         self._log_listeners.discard(callback)
 
-    def add_termination_listener(self, callback):
+    def add_termination_listener(self, callback: TerminationListener) -> None:
         """Add a listener that will be called when the connection is closed.
 
         :param callable callback:
@@ -190,7 +282,8 @@ class Connection(metaclass=ConnectionMeta):
         """
         self._termination_listeners.add(callback)
 
-    def remove_termination_listener(self, callback):
+    def remove_termination_listener(self,
+                                    callback: TerminationListener) -> None:
         """Remove a listening callback for connection termination.
 
         :param callable callback:
@@ -201,11 +294,11 @@ class Connection(metaclass=ConnectionMeta):
         """
         self._termination_listeners.discard(callback)
 
-    def get_server_pid(self):
+    def get_server_pid(self) -> int:
         """Return the PID of the Postgres server the connection is bound to."""
         return self._protocol.get_server_pid()
 
-    def get_server_version(self):
+    def get_server_version(self) -> 'types.ServerVersion':
         """Return the version of the connected PostgreSQL server.
 
         The returned value is a named tuple similar to that in
@@ -221,15 +314,19 @@ class Connection(metaclass=ConnectionMeta):
         """
         return self._server_version
 
-    def get_settings(self):
+    def get_settings(self) -> '_cprotocol.ConnectionSettings':
         """Return connection settings.
 
         :return: :class:`~asyncpg.ConnectionSettings`.
         """
         return self._protocol.get_settings()
 
-    def transaction(self, *, isolation=None, readonly=False,
-                    deferrable=False):
+    def transaction(self, *,
+                    isolation: typing.Optional[
+                        transaction.IsolationLevels
+                    ] = None,
+                    readonly: bool = False,
+                    deferrable: bool = False) -> transaction.Transaction:
         """Create a :class:`~transaction.Transaction` object.
 
         Refer to `PostgreSQL documentation`_ on the meaning of transaction
@@ -254,7 +351,7 @@ class Connection(metaclass=ConnectionMeta):
         self._check_open()
         return transaction.Transaction(self, isolation, readonly, deferrable)
 
-    def is_in_transaction(self):
+    def is_in_transaction(self) -> bool:
         """Return True if Connection is currently inside a transaction.
 
         :return bool: True if inside transaction, False otherwise.
@@ -263,7 +360,8 @@ class Connection(metaclass=ConnectionMeta):
         """
         return self._protocol.is_in_transaction()
 
-    async def execute(self, query: str, *args, timeout: float=None) -> str:
+    async def execute(self, query: str, *args: typing.Any,
+                      timeout: typing.Optional[float] = None) -> str:
         """Execute an SQL command (or commands).
 
         This method can execute many SQL commands at once, when no arguments
@@ -305,7 +403,9 @@ class Connection(metaclass=ConnectionMeta):
         )
         return status.decode()
 
-    async def executemany(self, command: str, args, *, timeout: float=None):
+    async def executemany(self, command: str,
+                          args: typing.Iterable[typing.Sequence[typing.Any]],
+                          *, timeout: typing.Optional[float] = None) -> None:
         """Execute an SQL *command* for each sequence of arguments in *args*.
 
         Example:
@@ -336,25 +436,75 @@ class Connection(metaclass=ConnectionMeta):
         self._check_open()
         return await self._executemany(command, args, timeout)
 
+    @typing.overload
     async def _get_statement(
         self,
-        query,
-        timeout,
+        query: str,
+        timeout: typing.Optional[float],
         *,
-        named: bool=False,
-        use_cache: bool=True,
-        ignore_custom_codec=False,
-        record_class=None
-    ):
-        if record_class is None:
-            record_class = self._protocol.get_record_class()
+        named: bool = ...,
+        use_cache: bool = ...,
+        ignore_custom_codec: bool = ...,
+        record_class: None = ...
+    ) -> '_cprotocol.PreparedStatementState[_Record]':
+        ...
+
+    @typing.overload
+    async def _get_statement(
+        self,
+        query: str,
+        timeout: typing.Optional[float],
+        *,
+        named: bool = False,
+        use_cache: bool = True,
+        ignore_custom_codec: bool = ...,
+        record_class: typing.Type[_OtherRecord]
+    ) -> '_cprotocol.PreparedStatementState[_OtherRecord]':
+        ...
+
+    @typing.overload
+    async def _get_statement(
+        self,
+        query: str,
+        timeout: typing.Optional[float],
+        *,
+        named: bool = ...,
+        use_cache: bool = ...,
+        ignore_custom_codec: bool = ...,
+        record_class: typing.Optional[typing.Type[_OtherRecord]]
+    ) -> typing.Union[
+        '_cprotocol.PreparedStatementState[_Record]',
+        '_cprotocol.PreparedStatementState[_OtherRecord]',
+    ]:
+        ...
+
+    async def _get_statement(
+        self,
+        query: str,
+        timeout: typing.Optional[float],
+        *,
+        named: bool = False,
+        use_cache: bool = True,
+        ignore_custom_codec: bool = False,
+        record_class: typing.Optional[typing.Type[_OtherRecord]] = None
+    ) -> '_cprotocol.PreparedStatementState[typing.Any]':
+        record_cls: typing.Optional[
+            typing.Union[
+                typing.Type[_Record],
+                typing.Type[_OtherRecord]
+            ]
+        ] = record_class
+
+        if record_cls is None:
+            record_cls = self._protocol.get_record_class()
         else:
-            _check_record_class(record_class)
+            _check_record_class(record_cls)
 
         if use_cache:
-            statement = self._stmt_cache.get(
-                (query, record_class, ignore_custom_codec)
-            )
+            statement: typing.Optional[
+                '_cprotocol.PreparedStatementState[typing.Any]'
+            ] = self._stmt_cache.get((query, record_cls, ignore_custom_codec))
+
             if statement is not None:
                 return statement
 
@@ -376,7 +526,7 @@ class Connection(metaclass=ConnectionMeta):
             stmt_name,
             query,
             timeout,
-            record_class=record_class,
+            record_class=record_cls,
             ignore_custom_codec=ignore_custom_codec,
         )
         need_reprepare = False
@@ -418,12 +568,12 @@ class Connection(metaclass=ConnectionMeta):
                 query,
                 timeout,
                 state=statement,
-                record_class=record_class,
+                record_class=record_cls,
             )
 
         if use_cache:
             self._stmt_cache.put(
-                (query, record_class, ignore_custom_codec), statement)
+                (query, record_cls, ignore_custom_codec), statement)
 
         # If we've just created a new statement object, check if there
         # are any statements for GC.
@@ -432,7 +582,13 @@ class Connection(metaclass=ConnectionMeta):
 
         return statement
 
-    async def _introspect_types(self, typeoids, timeout):
+    async def _introspect_types(
+        self,
+        typeoids: typing.Set[int],
+        timeout: typing.Optional[float]
+    ) -> typing.Tuple[
+        typing.Any, '_cprotocol.PreparedStatementState[_Record]'
+    ]:
         return await self.__execute(
             self._intro_query,
             (list(typeoids),),
@@ -441,7 +597,7 @@ class Connection(metaclass=ConnectionMeta):
             ignore_custom_codec=True,
         )
 
-    async def _introspect_type(self, typename, schema):
+    async def _introspect_type(self, typename: str, schema: str) -> typing.Any:
         if (
             schema == 'pg_catalog'
             and typename.lower() in protocol.BUILTIN_TYPE_NAME_MAP
@@ -469,14 +625,53 @@ class Connection(metaclass=ConnectionMeta):
 
         return rows[0]
 
+    @typing.overload
     def cursor(
         self,
-        query,
-        *args,
-        prefetch=None,
-        timeout=None,
-        record_class=None
-    ):
+        query: str,
+        *args: typing.Any,
+        prefetch: typing.Optional[int] = ...,
+        timeout: typing.Optional[float] = ...,
+        record_class: None = ...
+    ) -> 'cursor.CursorFactory[_Record]':
+        ...
+
+    @typing.overload
+    def cursor(
+        self,
+        query: str,
+        *args: typing.Any,
+        prefetch: typing.Optional[int] = ...,
+        timeout: typing.Optional[float] = ...,
+        record_class: typing.Type[_OtherRecord]
+    ) -> 'cursor.CursorFactory[_OtherRecord]':
+        ...
+
+    @typing.overload
+    def cursor(
+        self,
+        query: str,
+        *args: typing.Any,
+        prefetch: typing.Optional[int] = ...,
+        timeout: typing.Optional[float] = ...,
+        record_class: typing.Optional[typing.Type[_OtherRecord]]
+    ) -> typing.Union[
+        'cursor.CursorFactory[_Record]',
+        'cursor.CursorFactory[_OtherRecord]',
+    ]:
+        ...
+
+    def cursor(
+        self,
+        query: str,
+        *args: typing.Any,
+        prefetch: typing.Optional[int] = None,
+        timeout: typing.Optional[float] = None,
+        record_class: typing.Optional[typing.Type[_OtherRecord]] = None
+    ) -> typing.Union[
+        'cursor.CursorFactory[_OtherRecord]',
+        'cursor.CursorFactory[_Record]',
+    ]:
         """Return a *cursor factory* for the specified query.
 
         :param args:
@@ -508,7 +703,49 @@ class Connection(metaclass=ConnectionMeta):
             record_class,
         )
 
-    async def prepare(self, query, *, timeout=None, record_class=None):
+    @typing.overload
+    async def prepare(
+        self,
+        query: str,
+        *,
+        timeout: typing.Optional[float] = ...,
+        record_class: None = ...
+    ) -> prepared_stmt.PreparedStatement[_Record]:
+        ...
+
+    @typing.overload
+    async def prepare(
+        self,
+        query: str,
+        *,
+        timeout: typing.Optional[float] = ...,
+        record_class: typing.Type[_OtherRecord]
+    ) -> prepared_stmt.PreparedStatement[_OtherRecord]:
+        ...
+
+    @typing.overload
+    async def prepare(
+        self,
+        query: str,
+        *,
+        timeout: typing.Optional[float] = ...,
+        record_class: typing.Optional[typing.Type[_OtherRecord]]
+    ) -> typing.Union[
+        prepared_stmt.PreparedStatement[_Record],
+        prepared_stmt.PreparedStatement[_OtherRecord]
+    ]:
+        ...
+
+    async def prepare(
+        self,
+        query: str,
+        *,
+        timeout: typing.Optional[float] = None,
+        record_class: typing.Optional[typing.Type[_OtherRecord]] = None
+    ) -> typing.Union[
+        prepared_stmt.PreparedStatement[_Record],
+        prepared_stmt.PreparedStatement[_OtherRecord]
+    ]:
         """Create a *prepared statement* for the specified query.
 
         :param str query:
@@ -534,14 +771,53 @@ class Connection(metaclass=ConnectionMeta):
             record_class=record_class,
         )
 
+    @typing.overload
     async def _prepare(
         self,
-        query,
+        query: str,
         *,
-        timeout=None,
-        use_cache: bool=False,
-        record_class=None
-    ):
+        timeout: typing.Optional[float] = ...,
+        use_cache: bool = ...,
+        record_class: None = ...
+    ) -> prepared_stmt.PreparedStatement[_Record]:
+        ...
+
+    @typing.overload
+    async def _prepare(
+        self,
+        query: str,
+        *,
+        timeout: typing.Optional[float] = ...,
+        use_cache: bool = ...,
+        record_class: typing.Type[_OtherRecord]
+    ) -> prepared_stmt.PreparedStatement[_OtherRecord]:
+        ...
+
+    @typing.overload
+    async def _prepare(
+        self,
+        query: str,
+        *,
+        timeout: typing.Optional[float] = ...,
+        use_cache: bool = ...,
+        record_class: typing.Optional[typing.Type[_OtherRecord]]
+    ) -> typing.Union[
+        prepared_stmt.PreparedStatement[_Record],
+        prepared_stmt.PreparedStatement[_OtherRecord]
+    ]:
+        ...
+
+    async def _prepare(
+        self,
+        query: str,
+        *,
+        timeout: typing.Optional[float] = None,
+        use_cache: bool = False,
+        record_class: typing.Optional[typing.Type[_OtherRecord]] = None
+    ) -> typing.Union[
+        prepared_stmt.PreparedStatement[_Record],
+        prepared_stmt.PreparedStatement[_OtherRecord]
+    ]:
         self._check_open()
         stmt = await self._get_statement(
             query,
@@ -550,15 +826,53 @@ class Connection(metaclass=ConnectionMeta):
             use_cache=use_cache,
             record_class=record_class,
         )
-        return prepared_stmt.PreparedStatement(self, query, stmt)
+        return prepared_stmt.PreparedStatement(self, query, typing.cast(
+            '_cprotocol.PreparedStatementState[typing.Any]', stmt
+        ))
+
+    @typing.overload
+    async def fetch(
+        self,
+        query: str,
+        *args: typing.Any,
+        timeout: typing.Optional[float] = ...,
+        record_class: None = ...
+    ) -> typing.List[_Record]:
+        ...
+
+    @typing.overload
+    async def fetch(
+        self,
+        query: str,
+        *args: typing.Any,
+        timeout: typing.Optional[float] = ...,
+        record_class: typing.Type[_OtherRecord]
+    ) -> typing.List[_OtherRecord]:
+        ...
+
+    @typing.overload
+    async def fetch(
+        self,
+        query: str,
+        *args: typing.Any,
+        timeout: typing.Optional[float] = ...,
+        record_class: typing.Optional[typing.Type[_OtherRecord]]
+    ) -> typing.Union[
+        typing.List[_Record],
+        typing.List[_OtherRecord]
+    ]:
+        ...
 
     async def fetch(
         self,
-        query,
-        *args,
-        timeout=None,
-        record_class=None
-    ) -> list:
+        query: str,
+        *args: typing.Any,
+        timeout: typing.Optional[float] = None,
+        record_class: typing.Optional[typing.Type[_OtherRecord]] = None
+    ) -> typing.Union[
+        typing.List[_Record],
+        typing.List[_OtherRecord]
+    ]:
         """Run a query and return the results as a list of :class:`Record`.
 
         :param str query:
@@ -588,7 +902,8 @@ class Connection(metaclass=ConnectionMeta):
             record_class=record_class,
         )
 
-    async def fetchval(self, query, *args, column=0, timeout=None):
+    async def fetchval(self, query: str, *args: typing.Any, column: int = 0,
+                       timeout: typing.Optional[float] = None) -> typing.Any:
         """Run a query and return a value in the first row.
 
         :param str query: Query text.
@@ -609,13 +924,46 @@ class Connection(metaclass=ConnectionMeta):
             return None
         return data[0][column]
 
+    @typing.overload
     async def fetchrow(
         self,
-        query,
-        *args,
-        timeout=None,
-        record_class=None
-    ):
+        query: str,
+        *args: typing.Any,
+        timeout: typing.Optional[float] = ...,
+        record_class: None = ...
+    ) -> typing.Optional[_Record]:
+        ...
+
+    @typing.overload
+    async def fetchrow(
+        self,
+        query: str,
+        *args: typing.Any,
+        timeout: typing.Optional[float] = ...,
+        record_class: typing.Type[_OtherRecord]
+    ) -> typing.Optional[_OtherRecord]:
+        ...
+
+    @typing.overload
+    async def fetchrow(
+        self,
+        query: str,
+        *args: typing.Any,
+        timeout: typing.Optional[float] = ...,
+        record_class: typing.Optional[typing.Type[_OtherRecord]]
+    ) -> typing.Union[
+        typing.Optional[_Record],
+        typing.Optional[_OtherRecord]
+    ]:
+        ...
+
+    async def fetchrow(
+        self,
+        query: str,
+        *args: typing.Any,
+        timeout: typing.Optional[float] = None,
+        record_class: typing.Optional[typing.Type[_OtherRecord]] = None
+    ) -> typing.Union[None, _Record, _OtherRecord]:
         """Run a query and return the first row.
 
         :param str query:
@@ -649,11 +997,22 @@ class Connection(metaclass=ConnectionMeta):
             return None
         return data[0]
 
-    async def copy_from_table(self, table_name, *, output,
-                              columns=None, schema_name=None, timeout=None,
-                              format=None, oids=None, delimiter=None,
-                              null=None, header=None, quote=None,
-                              escape=None, force_quote=None, encoding=None):
+    async def copy_from_table(self, table_name: str, *,
+                              output: OutputType,
+                              columns: typing.Optional[
+                                  typing.Iterable[str]
+                              ] = None,
+                              schema_name: typing.Optional[str] = None,
+                              timeout: typing.Optional[float] = None,
+                              format: typing.Optional[CopyFormat] = None,
+                              oids: typing.Optional[int] = None,
+                              delimiter: typing.Optional[str] = None,
+                              null: typing.Optional[str] = None,
+                              header: typing.Optional[bool] = None,
+                              quote: typing.Optional[str] = None,
+                              escape: typing.Optional[str] = None,
+                              force_quote: typing.Optional[bool] = None,
+                              encoding: typing.Optional[str] = None) -> str:
         """Copy table contents to a file or file-like object.
 
         :param str table_name:
@@ -721,11 +1080,18 @@ class Connection(metaclass=ConnectionMeta):
 
         return await self._copy_out(copy_stmt, output, timeout)
 
-    async def copy_from_query(self, query, *args, output,
-                              timeout=None, format=None, oids=None,
-                              delimiter=None, null=None, header=None,
-                              quote=None, escape=None, force_quote=None,
-                              encoding=None):
+    async def copy_from_query(self, query: str, *args: typing.Any,
+                              output: OutputType,
+                              timeout: typing.Optional[float] = None,
+                              format: typing.Optional[CopyFormat] = None,
+                              oids: typing.Optional[int] = None,
+                              delimiter: typing.Optional[str] = None,
+                              null: typing.Optional[str] = None,
+                              header: typing.Optional[bool] = None,
+                              quote: typing.Optional[str] = None,
+                              escape: typing.Optional[str] = None,
+                              force_quote: typing.Optional[bool] = None,
+                              encoding: typing.Optional[str] = None) -> str:
         """Copy the results of a query to a file or file-like object.
 
         :param str query:
@@ -783,13 +1149,24 @@ class Connection(metaclass=ConnectionMeta):
 
         return await self._copy_out(copy_stmt, output, timeout)
 
-    async def copy_to_table(self, table_name, *, source,
-                            columns=None, schema_name=None, timeout=None,
-                            format=None, oids=None, freeze=None,
-                            delimiter=None, null=None, header=None,
-                            quote=None, escape=None, force_quote=None,
-                            force_not_null=None, force_null=None,
-                            encoding=None):
+    async def copy_to_table(self, table_name: str, *,
+                            source: SourceType,
+                            columns: typing.Optional[
+                                typing.Iterable[str]] = None,
+                            schema_name: typing.Optional[str] = None,
+                            timeout: typing.Optional[float] = None,
+                            format: typing.Optional[CopyFormat] = None,
+                            oids: typing.Optional[int] = None,
+                            freeze: typing.Optional[bool] = None,
+                            delimiter: typing.Optional[str] = None,
+                            null: typing.Optional[str] = None,
+                            header: typing.Optional[bool] = None,
+                            quote: typing.Optional[str] = None,
+                            escape: typing.Optional[str] = None,
+                            force_quote: typing.Optional[bool] = None,
+                            force_not_null: typing.Optional[bool] = None,
+                            force_null: typing.Optional[bool] = None,
+                            encoding: typing.Optional[str] = None) -> str:
         """Copy data to the specified table.
 
         :param str table_name:
@@ -858,9 +1235,14 @@ class Connection(metaclass=ConnectionMeta):
 
         return await self._copy_in(copy_stmt, source, timeout)
 
-    async def copy_records_to_table(self, table_name, *, records,
-                                    columns=None, schema_name=None,
-                                    timeout=None):
+    async def copy_records_to_table(self, table_name: str, *,
+                                    records: typing.Iterable[
+                                        typing.Sequence[typing.Any]],
+                                    columns: typing.Optional[
+                                        typing.Iterable[str]] = None,
+                                    schema_name: typing.Optional[str] = None,
+                                    timeout: typing.Optional[float] = None) \
+            -> str:
         """Copy a list of records to the specified table using binary COPY.
 
         :param str table_name:
@@ -923,10 +1305,19 @@ class Connection(metaclass=ConnectionMeta):
         return await self._copy_in_records(
             copy_stmt, records, intro_ps._state, timeout)
 
-    def _format_copy_opts(self, *, format=None, oids=None, freeze=None,
-                          delimiter=None, null=None, header=None, quote=None,
-                          escape=None, force_quote=None, force_not_null=None,
-                          force_null=None, encoding=None):
+    def _format_copy_opts(self, *,
+                          format: typing.Optional[CopyFormat] = None,
+                          oids: typing.Optional[int] = None,
+                          freeze: typing.Optional[bool] = None,
+                          delimiter: typing.Optional[str] = None,
+                          null: typing.Optional[str] = None,
+                          header: typing.Optional[bool] = None,
+                          quote: typing.Optional[str] = None,
+                          escape: typing.Optional[str] = None,
+                          force_quote: typing.Optional[bool] = None,
+                          force_not_null: typing.Optional[bool] = None,
+                          force_null: typing.Optional[bool] = None,
+                          encoding: typing.Optional[str] = None) -> str:
         kwargs = dict(locals())
         kwargs.pop('self')
         opts = []
@@ -952,24 +1343,29 @@ class Connection(metaclass=ConnectionMeta):
         else:
             return ''
 
-    async def _copy_out(self, copy_stmt, output, timeout):
+    async def _copy_out(self, copy_stmt: str,
+                        output: OutputType,
+                        timeout: typing.Optional[float]) -> str:
         try:
-            path = compat.fspath(output)
+            path: typing.Optional[typing.Union[str, bytes]] = os.fspath(
+                typing.cast('_typeshed.AnyPath', output)
+            )
         except TypeError:
             # output is not a path-like object
             path = None
 
-        writer = None
+        writer: typing.Optional[_Writer] = None
         opened_by_us = False
         run_in_executor = self._loop.run_in_executor
 
         if path is not None:
             # a path
-            f = await run_in_executor(None, open, path, 'wb')
+            f: typing.BinaryIO = await run_in_executor(
+                None, open, path, 'wb')
             opened_by_us = True
         elif hasattr(output, 'write'):
             # file-like
-            f = output
+            f = typing.cast(typing.BinaryIO, output)
         elif callable(output):
             # assuming calling output returns an awaitable.
             writer = output
@@ -981,8 +1377,9 @@ class Connection(metaclass=ConnectionMeta):
             )
 
         if writer is None:
-            async def _writer(data):
+            async def _writer(data: bytes) -> None:
                 await run_in_executor(None, f.write, data)
+
             writer = _writer
 
         try:
@@ -991,14 +1388,18 @@ class Connection(metaclass=ConnectionMeta):
             if opened_by_us:
                 f.close()
 
-    async def _copy_in(self, copy_stmt, source, timeout):
+    async def _copy_in(self, copy_stmt: str,
+                       source: SourceType,
+                       timeout: typing.Optional[float]) -> str:
         try:
-            path = compat.fspath(source)
+            path: typing.Optional[typing.Union[str, bytes]] = os.fspath(
+                typing.cast('_typeshed.AnyPath', source)
+            )
         except TypeError:
             # source is not a path-like object
             path = None
 
-        f = None
+        f: typing.Optional[typing.BinaryIO] = None
         reader = None
         data = None
         opened_by_us = False
@@ -1010,7 +1411,7 @@ class Connection(metaclass=ConnectionMeta):
             opened_by_us = True
         elif hasattr(source, 'read'):
             # file-like
-            f = source
+            f = typing.cast(typing.BinaryIO, source)
         elif isinstance(source, collections.abc.AsyncIterable):
             # assuming calling output returns an awaitable.
             # copy_in() is designed to handle very large amounts of data, and
@@ -1024,12 +1425,15 @@ class Connection(metaclass=ConnectionMeta):
         if f is not None:
             # Copying from a file-like object.
             class _Reader:
-                @compat.aiter_compat
-                def __aiter__(self):
+                def __aiter__(self) -> '_Reader':
                     return self
 
-                async def __anext__(self):
-                    data = await run_in_executor(None, f.read, 524288)
+                async def __anext__(self) -> bytes:
+                    data: bytes = await run_in_executor(
+                        None,
+                        typing.cast(typing.BinaryIO, f).read,
+                        524288
+                    )
                     if len(data) == 0:
                         raise StopAsyncIteration
                     else:
@@ -1042,15 +1446,29 @@ class Connection(metaclass=ConnectionMeta):
                 copy_stmt, reader, data, None, None, timeout)
         finally:
             if opened_by_us:
-                await run_in_executor(None, f.close)
+                await run_in_executor(
+                    None, typing.cast(typing.BinaryIO, f).close
+                )
 
-    async def _copy_in_records(self, copy_stmt, records, intro_stmt, timeout):
+    async def _copy_in_records(
+        self,
+        copy_stmt: str,
+        records: typing.Iterable[
+            typing.Sequence[typing.Any]
+        ],
+        intro_stmt: '_cprotocol.PreparedStatementState[typing.Any]',
+        timeout: typing.Optional[float]
+    ) -> str:
         return await self._protocol.copy_in(
             copy_stmt, None, None, records, intro_stmt, timeout)
 
-    async def set_type_codec(self, typename, *,
-                             schema='public', encoder, decoder,
-                             format='text'):
+    async def set_type_codec(self, typename: str, *,
+                             schema: str = 'public',
+                             encoder: typing.Callable[[typing.Any],
+                                                      typing.Any],
+                             decoder: typing.Callable[[typing.Any],
+                                                      typing.Any],
+                             format: str = 'text') -> None:
         """Set an encoder/decoder pair for the specified data type.
 
         :param typename:
@@ -1186,7 +1604,8 @@ class Connection(metaclass=ConnectionMeta):
         # Statement cache is no longer valid due to codec changes.
         self._drop_local_statement_cache()
 
-    async def reset_type_codec(self, typename, *, schema='public'):
+    async def reset_type_codec(self, typename: str, *,
+                               schema: str = 'public') -> None:
         """Reset *typename* codec to the default implementation.
 
         :param typename:
@@ -1206,9 +1625,11 @@ class Connection(metaclass=ConnectionMeta):
         # Statement cache is no longer valid due to codec changes.
         self._drop_local_statement_cache()
 
-    async def set_builtin_type_codec(self, typename, *,
-                                     schema='public', codec_name,
-                                     format=None):
+    async def set_builtin_type_codec(self, typename: str, *,
+                                     schema: str = 'public',
+                                     codec_name: str,
+                                     format: typing.Optional[str] = None) \
+            -> None:
         """Set a builtin codec for the specified scalar data type.
 
         This method has two uses.  The first is to register a builtin
@@ -1256,7 +1677,7 @@ class Connection(metaclass=ConnectionMeta):
         # Statement cache is no longer valid due to codec changes.
         self._drop_local_statement_cache()
 
-    def is_closed(self):
+    def is_closed(self) -> bool:
         """Return ``True`` if the connection is closed, ``False`` otherwise.
 
         :return bool: ``True`` if the connection is closed, ``False``
@@ -1264,7 +1685,7 @@ class Connection(metaclass=ConnectionMeta):
         """
         return self._aborted or not self._protocol.is_connected()
 
-    async def close(self, *, timeout=None):
+    async def close(self, *, timeout: typing.Optional[float] = None) -> None:
         """Close the connection gracefully.
 
         :param float timeout:
@@ -1283,13 +1704,13 @@ class Connection(metaclass=ConnectionMeta):
         finally:
             self._cleanup()
 
-    def terminate(self):
+    def terminate(self) -> None:
         """Terminate the connection without waiting for pending data."""
         if not self.is_closed():
             self._abort()
         self._cleanup()
 
-    async def reset(self, *, timeout=None):
+    async def reset(self, *, timeout: typing.Optional[float] = None) -> None:
         self._check_open()
         self._listeners.clear()
         self._log_listeners.clear()
@@ -1310,13 +1731,13 @@ class Connection(metaclass=ConnectionMeta):
         if reset_query:
             await self.execute(reset_query, timeout=timeout)
 
-    def _abort(self):
+    def _abort(self) -> None:
         # Put the connection into the aborted state.
         self._aborted = True
         self._protocol.abort()
-        self._protocol = None
+        self._protocol = None  # type: ignore[assignment]
 
-    def _cleanup(self):
+    def _cleanup(self) -> None:
         self._call_termination_listeners()
         # Free the resources associated with this connection.
         # This must be called when a connection is terminated.
@@ -1331,7 +1752,7 @@ class Connection(metaclass=ConnectionMeta):
         self._log_listeners.clear()
         self._clean_tasks()
 
-    def _clean_tasks(self):
+    def _clean_tasks(self) -> None:
         # Wrap-up any remaining tasks associated with this connection.
         if self._cancellations:
             for fut in self._cancellations:
@@ -1339,16 +1760,16 @@ class Connection(metaclass=ConnectionMeta):
                     fut.cancel()
             self._cancellations.clear()
 
-    def _check_open(self):
+    def _check_open(self) -> None:
         if self.is_closed():
             raise exceptions.InterfaceError('connection is closed')
 
-    def _get_unique_id(self, prefix):
+    def _get_unique_id(self, prefix: str) -> str:
         global _uid
         _uid += 1
         return '__asyncpg_{}_{:x}__'.format(prefix, _uid)
 
-    def _mark_stmts_as_closed(self):
+    def _mark_stmts_as_closed(self) -> None:
         for stmt in self._stmt_cache.iter_statements():
             stmt.mark_closed()
 
@@ -1358,7 +1779,9 @@ class Connection(metaclass=ConnectionMeta):
         self._stmt_cache.clear()
         self._stmts_to_close.clear()
 
-    def _maybe_gc_stmt(self, stmt):
+    def _maybe_gc_stmt(
+        self, stmt: '_cprotocol.PreparedStatementState[typing.Any]'
+    ) -> None:
         if (
             stmt.refs == 0
             and not self._stmt_cache.has(
@@ -1376,7 +1799,7 @@ class Connection(metaclass=ConnectionMeta):
             stmt.mark_closed()
             self._stmts_to_close.add(stmt)
 
-    async def _cleanup_stmts(self):
+    async def _cleanup_stmts(self) -> None:
         # Called whenever we create a new prepared statement in
         # `Connection._get_statement()` and `_stmts_to_close` is
         # not empty.
@@ -1387,7 +1810,7 @@ class Connection(metaclass=ConnectionMeta):
             # so we ignore the timeout.
             await self._protocol.close_statement(stmt, protocol.NO_TIMEOUT)
 
-    async def _cancel(self, waiter):
+    async def _cancel(self, waiter: 'asyncio.Future[None]') -> None:
         try:
             # Open new connection to the server
             await connect_utils._cancel(
@@ -1411,15 +1834,17 @@ class Connection(metaclass=ConnectionMeta):
             if not waiter.done():
                 waiter.set_exception(ex)
         finally:
-            self._cancellations.discard(
-                compat.current_asyncio_task(self._loop))
+            current_task = compat.current_asyncio_task(self._loop)
+            if current_task is not None:
+                self._cancellations.discard(current_task)
             if not waiter.done():
                 waiter.set_result(None)
 
-    def _cancel_current_command(self, waiter):
+    def _cancel_current_command(self, waiter: 'asyncio.Future[None]') -> None:
         self._cancellations.add(self._loop.create_task(self._cancel(waiter)))
 
-    def _process_log_message(self, fields, last_query):
+    def _process_log_message(self, fields: typing.Dict[str, str],
+                             last_query: str) -> None:
         if not self._log_listeners:
             return
 
@@ -1430,7 +1855,11 @@ class Connection(metaclass=ConnectionMeta):
             self._loop.call_soon(
                 self._call_log_listener, cb, con_ref, message)
 
-    def _call_log_listener(self, cb, con_ref, message):
+    def _call_log_listener(self, cb: LogListener,
+                           con_ref: typing.Union[
+                               'Connection[_Record]',
+                               '_pool.PoolConnectionProxy[typing.Any]'],
+                           message: exceptions.PostgresLogMessage) -> None:
         try:
             cb(con_ref, message)
         except Exception as ex:
@@ -1440,7 +1869,7 @@ class Connection(metaclass=ConnectionMeta):
                 'exception': ex
             })
 
-    def _call_termination_listeners(self):
+    def _call_termination_listeners(self) -> None:
         if not self._termination_listeners:
             return
 
@@ -1459,7 +1888,8 @@ class Connection(metaclass=ConnectionMeta):
 
         self._termination_listeners.clear()
 
-    def _process_notification(self, pid, channel, payload):
+    def _process_notification(self, pid: int, channel: str,
+                              payload: typing.Any) -> None:
         if channel not in self._listeners:
             return
 
@@ -1468,7 +1898,17 @@ class Connection(metaclass=ConnectionMeta):
             self._loop.call_soon(
                 self._call_listener, cb, con_ref, pid, channel, payload)
 
-    def _call_listener(self, cb, con_ref, pid, channel, payload):
+    def _call_listener(
+        self,
+        cb: Listener,
+        con_ref: typing.Union[
+            'Connection[_Record]',
+            '_pool.PoolConnectionProxy[typing.Any]'
+        ],
+        pid: int,
+        channel: str,
+        payload: typing.Any
+    ) -> None:
         try:
             cb(con_ref, pid, channel, payload)
         except Exception as ex:
@@ -1478,9 +1918,12 @@ class Connection(metaclass=ConnectionMeta):
                 'exception': ex
             })
 
-    def _unwrap(self):
+    def _unwrap(self) -> typing.Union['Connection[_Record]',
+                                      '_pool.PoolConnectionProxy[typing.Any]']:
         if self._proxy is None:
-            con_ref = self
+            con_ref: typing.Union[
+                Connection[_Record], '_pool.PoolConnectionProxy[typing.Any]'
+            ] = self
         else:
             # `_proxy` is not None when the connection is a member
             # of a connection pool.  Which means that the user is working
@@ -1489,7 +1932,7 @@ class Connection(metaclass=ConnectionMeta):
             con_ref = self._proxy
         return con_ref
 
-    def _get_reset_query(self):
+    def _get_reset_query(self) -> str:
         if self._reset_query is not None:
             return self._reset_query
 
@@ -1505,12 +1948,13 @@ class Connection(metaclass=ConnectionMeta):
         if caps.sql_reset:
             _reset_query.append('RESET ALL;')
 
-        _reset_query = '\n'.join(_reset_query)
-        self._reset_query = _reset_query
+        self._reset_query = '\n'.join(_reset_query)
 
-        return _reset_query
+        return self._reset_query
 
-    def _set_proxy(self, proxy):
+    def _set_proxy(
+        self, proxy: typing.Optional['_pool.PoolConnectionProxy[typing.Any]']
+    ) -> None:
         if self._proxy is not None and proxy is not None:
             # Should not happen unless there is a bug in `Pool`.
             raise exceptions.InterfaceError(
@@ -1518,7 +1962,9 @@ class Connection(metaclass=ConnectionMeta):
 
         self._proxy = proxy
 
-    def _check_listeners(self, listeners, listener_type):
+    def _check_listeners(self,
+                         listeners: 'typing._Collection[_AnyCallable]',
+                         listener_type: str) -> None:
         if listeners:
             count = len(listeners)
 
@@ -1530,7 +1976,7 @@ class Connection(metaclass=ConnectionMeta):
 
             warnings.warn(w)
 
-    def _on_release(self, stacklevel=1):
+    def _on_release(self, stacklevel: int = 1) -> None:
         # Invalidate external references to the connection.
         self._pool_release_ctr += 1
         # Called when the connection is about to be released to the pool.
@@ -1541,10 +1987,10 @@ class Connection(metaclass=ConnectionMeta):
         self._check_listeners(
             self._log_listeners, 'log')
 
-    def _drop_local_statement_cache(self):
+    def _drop_local_statement_cache(self) -> None:
         self._stmt_cache.clear()
 
-    def _drop_global_statement_cache(self):
+    def _drop_global_statement_cache(self) -> None:
         if self._proxy is not None:
             # This connection is a member of a pool, so we delegate
             # the cache drop to the pool.
@@ -1553,10 +1999,10 @@ class Connection(metaclass=ConnectionMeta):
         else:
             self._drop_local_statement_cache()
 
-    def _drop_local_type_cache(self):
+    def _drop_local_type_cache(self) -> None:
         self._protocol.get_settings().clear_type_cache()
 
-    def _drop_global_type_cache(self):
+    def _drop_global_type_cache(self) -> None:
         if self._proxy is not None:
             # This connection is a member of a pool, so we delegate
             # the cache drop to the pool.
@@ -1565,7 +2011,7 @@ class Connection(metaclass=ConnectionMeta):
         else:
             self._drop_local_type_cache()
 
-    async def reload_schema_state(self):
+    async def reload_schema_state(self) -> None:
         """Indicate that the database schema information must be reloaded.
 
         For performance reasons, asyncpg caches certain aspects of the
@@ -1610,17 +2056,126 @@ class Connection(metaclass=ConnectionMeta):
         self._drop_global_type_cache()
         self._drop_global_statement_cache()
 
+    @typing.overload
     async def _execute(
         self,
-        query,
-        args,
-        limit,
-        timeout,
+        query: str,
+        args: typing.Sequence[typing.Any],
+        limit: int,
+        timeout: typing.Optional[float],
         *,
-        return_status=False,
-        ignore_custom_codec=False,
-        record_class=None
-    ):
+        return_status: compat.Literal[False] = ...,
+        ignore_custom_codec: bool = ...,
+        record_class: None = ...
+    ) -> _RecordsType[_Record]:
+        ...
+
+    @typing.overload
+    async def _execute(
+        self,
+        query: str,
+        args: typing.Sequence[typing.Any],
+        limit: int,
+        timeout: typing.Optional[float],
+        *,
+        return_status: compat.Literal[False] = ...,
+        ignore_custom_codec: bool = ...,
+        record_class: typing.Type[_OtherRecord]
+    ) -> _RecordsType[_OtherRecord]:
+        ...
+
+    @typing.overload
+    async def _execute(
+        self,
+        query: str,
+        args: typing.Sequence[typing.Any],
+        limit: int,
+        timeout: typing.Optional[float],
+        *,
+        return_status: compat.Literal[False] = ...,
+        ignore_custom_codec: bool = ...,
+        record_class: typing.Optional[typing.Type[_OtherRecord]]
+    ) -> typing.Union[
+        _RecordsType[_Record],
+        _RecordsType[_OtherRecord]
+    ]:
+        ...
+
+    @typing.overload
+    async def _execute(
+        self,
+        query: str,
+        args: typing.Sequence[typing.Any],
+        limit: int,
+        timeout: typing.Optional[float],
+        *,
+        return_status: compat.Literal[True],
+        ignore_custom_codec: bool = ...,
+        record_class: None = ...
+    ) -> _RecordsExtraType[_Record]:
+        ...
+
+    @typing.overload
+    async def _execute(
+        self,
+        query: str,
+        args: typing.Sequence[typing.Any],
+        limit: int,
+        timeout: typing.Optional[float],
+        *,
+        return_status: compat.Literal[True],
+        ignore_custom_codec: bool = ...,
+        record_class: typing.Type[_OtherRecord]
+    ) -> _RecordsExtraType[_OtherRecord]:
+        ...
+
+    @typing.overload
+    async def _execute(
+        self,
+        query: str,
+        args: typing.Sequence[typing.Any],
+        limit: int,
+        timeout: typing.Optional[float],
+        *,
+        return_status: compat.Literal[True],
+        ignore_custom_codec: bool = ...,
+        record_class: typing.Optional[typing.Type[_OtherRecord]]
+    ) -> typing.Union[
+        _RecordsExtraType[_Record],
+        _RecordsExtraType[_OtherRecord]
+    ]:
+        ...
+
+    @typing.overload
+    async def _execute(
+        self,
+        query: str,
+        args: typing.Sequence[typing.Any],
+        limit: int,
+        timeout: typing.Optional[float],
+        *,
+        return_status: bool,
+        ignore_custom_codec: bool = ...,
+        record_class: typing.Optional[typing.Type[_OtherRecord]]
+    ) -> typing.Union[
+        _RecordsExtraType[_Record],
+        _RecordsExtraType[_OtherRecord],
+        _RecordsType[_Record],
+        _RecordsType[_OtherRecord]
+    ]:
+        ...
+
+    async def _execute(
+        self,
+        query: str,
+        args: typing.Sequence[typing.Any],
+        limit: int,
+        timeout: typing.Optional[float],
+        *,
+        return_status: bool = False,
+        ignore_custom_codec: bool = False,
+        record_class: typing.Optional[typing.Type[_OtherRecord]] = None
+    ) -> typing.Any:
         with self._stmt_exclusive_section:
             result, _ = await self.__execute(
                 query,
@@ -1633,17 +2188,118 @@ class Connection(metaclass=ConnectionMeta):
             )
         return result
 
+    @typing.overload
     async def __execute(
         self,
-        query,
-        args,
-        limit,
-        timeout,
+        query: str,
+        args: typing.Sequence[typing.Any],
+        limit: int,
+        timeout: typing.Optional[float],
         *,
-        return_status=False,
-        ignore_custom_codec=False,
-        record_class=None
-    ):
+        return_status: compat.Literal[False] = ...,
+        ignore_custom_codec: bool = ...,
+        record_class: None = ...
+    ) -> typing.Tuple[
+        _RecordsType[_Record],
+        '_cprotocol.PreparedStatementState[_Record]'
+    ]:
+        ...
+
+    @typing.overload
+    async def __execute(
+        self,
+        query: str,
+        args: typing.Sequence[typing.Any],
+        limit: int,
+        timeout: typing.Optional[float],
+        *,
+        return_status: compat.Literal[False] = ...,
+        ignore_custom_codec: bool = ...,
+        record_class: typing.Type[_OtherRecord]
+    ) -> typing.Tuple[
+        _RecordsType[_OtherRecord],
+        '_cprotocol.PreparedStatementState[_OtherRecord]'
+    ]:
+        ...
+
+    @typing.overload
+    async def __execute(
+        self,
+        query: str,
+        args: typing.Sequence[typing.Any],
+        limit: int,
+        timeout: typing.Optional[float],
+        *,
+        return_status: compat.Literal[True],
+        ignore_custom_codec: bool = ...,
+        record_class: None = ...
+    ) -> typing.Tuple[
+        _RecordsExtraType[_Record],
+        '_cprotocol.PreparedStatementState[_Record]'
+    ]:
+        ...
+
+    @typing.overload
+    async def __execute(
+        self,
+        query: str,
+        args: typing.Sequence[typing.Any],
+        limit: int,
+        timeout: typing.Optional[float],
+        *,
+        return_status: compat.Literal[True],
+        ignore_custom_codec: bool = ...,
+        record_class: typing.Type[_OtherRecord]
+    ) -> typing.Tuple[
+        _RecordsExtraType[_OtherRecord],
+        '_cprotocol.PreparedStatementState[_OtherRecord]'
+    ]:
+        ...
+
+    @typing.overload
+    async def __execute(
+        self,
+        query: str,
+        args: typing.Sequence[typing.Any],
+        limit: int,
+        timeout: typing.Optional[float],
+        *,
+        return_status: bool,
+        ignore_custom_codec: bool = ...,
+        record_class: typing.Optional[typing.Type[_OtherRecord]]
+    ) -> typing.Union[
+        typing.Tuple[
+            _RecordsExtraType[_Record],
+            '_cprotocol.PreparedStatementState[_Record]'
+        ],
+        typing.Tuple[
+            _RecordsType[_Record],
+            '_cprotocol.PreparedStatementState[_Record]'
+        ],
+        typing.Tuple[
+            _RecordsExtraType[_OtherRecord],
+            '_cprotocol.PreparedStatementState[_OtherRecord]'
+        ],
+        typing.Tuple[
+            _RecordsType[_OtherRecord],
+            '_cprotocol.PreparedStatementState[_OtherRecord]'
+        ]
+    ]:
+        ...
+
+    async def __execute(
+        self,
+        query: str,
+        args: typing.Sequence[typing.Any],
+        limit: int,
+        timeout: typing.Optional[float],
+        *,
+        return_status: bool = False,
+        ignore_custom_codec: bool = False,
+        record_class: typing.Optional[typing.Type[_OtherRecord]] = None
+    ) -> typing.Tuple[
+        typing.Any, '_cprotocol.PreparedStatementState[typing.Any]'
+    ]:
         executor = lambda stmt, timeout: self._protocol.bind_execute(
             stmt, args, '', limit, return_status, timeout)
         timeout = self._protocol._get_timeout(timeout)
@@ -1655,24 +2311,84 @@ class Connection(metaclass=ConnectionMeta):
             ignore_custom_codec=ignore_custom_codec,
         )
 
-    async def _executemany(self, query, args, timeout):
+    async def _executemany(self, query: str,
+                           args: typing.Iterable[typing.Sequence[typing.Any]],
+                           timeout: typing.Optional[float]) -> None:
         executor = lambda stmt, timeout: self._protocol.bind_execute_many(
             stmt, args, '', timeout)
         timeout = self._protocol._get_timeout(timeout)
         with self._stmt_exclusive_section:
+            result: None
             result, _ = await self._do_execute(query, executor, timeout)
         return result
 
+    @typing.overload
     async def _do_execute(
         self,
-        query,
-        executor,
-        timeout,
-        retry=True,
+        query: str,
+        executor: Executor[_Record],
+        timeout: typing.Optional[float],
+        retry: bool = ...,
         *,
-        ignore_custom_codec=False,
-        record_class=None
-    ):
+        ignore_custom_codec: bool = ...,
+        record_class: None = ...
+    ) -> typing.Tuple[
+        typing.Any,
+        '_cprotocol.PreparedStatementState[_Record]'
+    ]:
+        ...
+
+    @typing.overload
+    async def _do_execute(
+        self,
+        query: str,
+        executor: Executor[_OtherRecord],
+        timeout: typing.Optional[float],
+        retry: bool = ...,
+        *,
+        ignore_custom_codec: bool = ...,
+        record_class: typing.Type[_OtherRecord]
+    ) -> typing.Tuple[
+        typing.Any,
+        '_cprotocol.PreparedStatementState[_OtherRecord]'
+    ]:
+        ...
+
+    @typing.overload
+    async def _do_execute(
+        self,
+        query: str,
+        executor: Executor[_OtherRecord],
+        timeout: typing.Optional[float],
+        retry: bool = ...,
+        *,
+        ignore_custom_codec: bool = ...,
+        record_class: typing.Optional[typing.Type[_OtherRecord]]
+    ) -> typing.Union[
+        typing.Tuple[
+            typing.Any,
+            '_cprotocol.PreparedStatementState[_Record]'
+        ],
+        typing.Tuple[
+            typing.Any,
+            '_cprotocol.PreparedStatementState[_OtherRecord]'
+        ]
+    ]:
+        ...
+
+    async def _do_execute(
+        self,
+        query: str,
+        executor: Executor[typing.Any],
+        timeout: typing.Optional[float],
+        retry: bool = True,
+        *,
+        ignore_custom_codec: bool = False,
+        record_class: typing.Optional[typing.Type[_OtherRecord]] = None
+    ) -> typing.Tuple[
+        typing.Any,
+        '_cprotocol.PreparedStatementState[typing.Any]'
+    ]:
         if timeout is None:
             stmt = await self._get_statement(
                 query,
@@ -1744,20 +2460,97 @@ class Connection(metaclass=ConnectionMeta):
         return result, stmt
 
 
-async def connect(dsn=None, *,
-                  host=None, port=None,
-                  user=None, password=None, passfile=None,
-                  database=None,
-                  loop=None,
-                  timeout=60,
-                  statement_cache_size=100,
-                  max_cached_statement_lifetime=300,
-                  max_cacheable_statement_size=1024 * 15,
-                  command_timeout=None,
-                  ssl=None,
-                  connection_class=Connection,
-                  record_class=protocol.Record,
-                  server_settings=None):
+if sys.version_info < (3, 7):
+    # see: https://bugs.python.org/issue41451
+    del Connection.__slots__
+
+
+@typing.overload
+async def connect(dsn: typing.Optional[str] = ..., *,
+                  host: typing.Optional[connect_utils.HostType] = ...,
+                  port: typing.Optional[connect_utils.PortType] = ...,
+                  user: typing.Optional[str] = ...,
+                  password: typing.Optional[PasswordType] = ...,
+                  passfile: typing.Optional[str] = ...,
+                  database: typing.Optional[str] = ...,
+                  loop: typing.Optional[asyncio.AbstractEventLoop] = ...,
+                  timeout: float = ...,
+                  statement_cache_size: int = ...,
+                  max_cached_statement_lifetime: int = ...,
+                  max_cacheable_statement_size: int = ...,
+                  command_timeout: typing.Optional[float] = ...,
+                  ssl: typing.Optional[connect_utils.SSLType] = ...,
+                  connection_class: typing.Type[Connection[_Record]] = ...,
+                  record_class: typing.Type[_Record],
+                  server_settings: typing.Optional[
+                      typing.Dict[str, str]] = ...) -> Connection[_Record]:
+    ...
+
+
+@typing.overload
+async def connect(dsn: typing.Optional[str] = ..., *,
+                  host: typing.Optional[connect_utils.HostType] = ...,
+                  port: typing.Optional[connect_utils.PortType] = ...,
+                  user: typing.Optional[str] = ...,
+                  password: typing.Optional[PasswordType] = ...,
+                  passfile: typing.Optional[str] = ...,
+                  database: typing.Optional[str] = ...,
+                  loop: typing.Optional[asyncio.AbstractEventLoop] = ...,
+                  timeout: float = ...,
+                  statement_cache_size: int = ...,
+                  max_cached_statement_lifetime: int = ...,
+                  max_cacheable_statement_size: int = ...,
+                  command_timeout: typing.Optional[float] = ...,
+                  ssl: typing.Optional[connect_utils.SSLType] = ...,
+                  connection_class: typing.Type[
+                      Connection[protocol.Record]] = ...,
+                  record_class: typing.Type[protocol.Record] = ...,
+                  server_settings: typing.Optional[
+                      typing.Dict[str, str]] = ...) \
+        -> Connection[protocol.Record]:
+    ...
+
+
+@typing.overload
+async def connect(dsn: typing.Optional[str] = ..., *,
+                  host: typing.Optional[connect_utils.HostType] = ...,
+                  port: typing.Optional[connect_utils.PortType] = ...,
+                  user: typing.Optional[str] = ...,
+                  password: typing.Optional[PasswordType] = ...,
+                  passfile: typing.Optional[str] = ...,
+                  database: typing.Optional[str] = ...,
+                  loop: typing.Optional[asyncio.AbstractEventLoop] = ...,
+                  timeout: float = ...,
+                  statement_cache_size: int = ...,
+                  max_cached_statement_lifetime: int = ...,
+                  max_cacheable_statement_size: int = ...,
+                  command_timeout: typing.Optional[float] = ...,
+                  ssl: typing.Optional[connect_utils.SSLType] = ...,
+                  connection_class: typing.Type[_Connection],
+                  record_class: typing.Type[_Record] = ...,
+                  server_settings: typing.Optional[
+                      typing.Dict[str, str]] = ...) -> _Connection:
+    ...
+
+
+async def connect(dsn: typing.Optional[str] = None, *,
+                  host: typing.Optional[connect_utils.HostType] = None,
+                  port: typing.Optional[connect_utils.PortType] = None,
+                  user: typing.Optional[str] = None,
+                  password: typing.Optional[PasswordType] = None,
+                  passfile: typing.Optional[str] = None,
+                  database: typing.Optional[str] = None,
+                  loop: typing.Optional[asyncio.AbstractEventLoop] = None,
+                  timeout: float = 60,
+                  statement_cache_size: int = 100,
+                  max_cached_statement_lifetime: int = 300,
+                  max_cacheable_statement_size: int = 1024 * 15,
+                  command_timeout: typing.Optional[float] = None,
+                  ssl: typing.Optional[connect_utils.SSLType] = None,
+                  connection_class: typing.Type[_Connection] = Connection,  # type: ignore[assignment]  # noqa: E501
+                  record_class: typing.Type[_Record] = protocol.Record,  # type: ignore[assignment]  # noqa: E501
+                  server_settings: typing.Optional[
+                      typing.Dict[str, str]] = None) -> _Connection:
     r"""A coroutine to establish a connection to a PostgreSQL server.
 
     The connection parameters may be specified either as a connection
@@ -1998,15 +2791,23 @@ async def connect(dsn=None, *,
     )
 
 
+_StatementCacheKey = typing.Tuple[str, typing.Type[_Record], bool]
+
+
 class _StatementCacheEntry:
 
     __slots__ = ('_query', '_statement', '_cache', '_cleanup_cb')
 
-    def __init__(self, cache, query, statement):
+    def __init__(
+        self,
+        cache: '_StatementCache',
+        query: _StatementCacheKey[_Record],
+        statement: '_cprotocol.PreparedStatementState[_Record]'
+    ) -> None:
         self._cache = cache
         self._query = query
         self._statement = statement
-        self._cleanup_cb = None
+        self._cleanup_cb: typing.Optional[asyncio.TimerHandle] = None
 
 
 class _StatementCache:
@@ -2014,7 +2815,9 @@ class _StatementCache:
     __slots__ = ('_loop', '_entries', '_max_size', '_on_remove',
                  '_max_lifetime')
 
-    def __init__(self, *, loop, max_size, on_remove, max_lifetime):
+    def __init__(self, *, loop: asyncio.AbstractEventLoop,
+                 max_size: int, on_remove: OnRemove[typing.Any],
+                 max_lifetime: float) -> None:
         self._loop = loop
         self._max_size = max_size
         self._on_remove = on_remove
@@ -2037,23 +2840,26 @@ class _StatementCache:
         # So new entries and hits are always promoted to the end of the
         # entries dict, whereas the unused one will group in the
         # beginning of it.
-        self._entries = collections.OrderedDict()
+        self._entries: collections.OrderedDict[
+            _StatementCacheKey['_cprotocol.Record'],
+            _StatementCacheEntry
+        ] = collections.OrderedDict()
 
-    def __len__(self):
+    def __len__(self) -> int:
         return len(self._entries)
 
-    def get_max_size(self):
+    def get_max_size(self) -> int:
         return self._max_size
 
-    def set_max_size(self, new_size):
+    def set_max_size(self, new_size: int) -> None:
         assert new_size >= 0
         self._max_size = new_size
         self._maybe_cleanup()
 
-    def get_max_lifetime(self):
+    def get_max_lifetime(self) -> float:
         return self._max_lifetime
 
-    def set_max_lifetime(self, new_lifetime):
+    def set_max_lifetime(self, new_lifetime: float) -> None:
         assert new_lifetime >= 0
         self._max_lifetime = new_lifetime
         for entry in self._entries.values():
@@ -2061,14 +2867,19 @@ class _StatementCache:
             # and setup a new one if necessary.
             self._set_entry_timeout(entry)
 
-    def get(self, query, *, promote=True):
+    def get(
+        self,
+        query: _StatementCacheKey[_Record],
+        *,
+        promote: bool = True
+    ) -> typing.Optional['_cprotocol.PreparedStatementState[_Record]']:
         if not self._max_size:
             # The cache is disabled.
-            return
+            return None
 
-        entry = self._entries.get(query)  # type: _StatementCacheEntry
+        entry: typing.Optional[_StatementCacheEntry] = self._entries.get(query)
         if entry is None:
-            return
+            return None
 
         if entry._statement.closed:
             # Happens in unittests when we call `stmt._state.mark_closed()`
@@ -2076,7 +2887,7 @@ class _StatementCache:
             # cache error.
             self._entries.pop(query)
             self._clear_entry_callback(entry)
-            return
+            return None
 
         if promote:
             # `promote` is `False` when `get()` is called by `has()`.
@@ -2084,10 +2895,14 @@ class _StatementCache:
 
         return entry._statement
 
-    def has(self, query):
+    def has(self, query: _StatementCacheKey[_Record]) -> bool:
         return self.get(query, promote=False) is not None
 
-    def put(self, query, statement):
+    def put(
+        self,
+        query: _StatementCacheKey[_Record],
+        statement: '_cprotocol.PreparedStatementState[_Record]'
+    ) -> None:
         if not self._max_size:
             # The cache is disabled.
             return
@@ -2098,10 +2913,12 @@ class _StatementCache:
         # if necessary.
         self._maybe_cleanup()
 
-    def iter_statements(self):
+    def iter_statements(self) -> typing.Iterator[
+        '_cprotocol.PreparedStatementState[typing.Any]'
+    ]:
         return (e._statement for e in self._entries.values())
 
-    def clear(self):
+    def clear(self) -> None:
         # Store entries for later.
         entries = tuple(self._entries.values())
 
@@ -2114,7 +2931,7 @@ class _StatementCache:
             self._clear_entry_callback(entry)
             self._on_remove(entry._statement)
 
-    def _set_entry_timeout(self, entry):
+    def _set_entry_timeout(self, entry: _StatementCacheEntry) -> None:
         # Clear the existing timeout.
         self._clear_entry_callback(entry)
 
@@ -2123,23 +2940,27 @@ class _StatementCache:
             entry._cleanup_cb = self._loop.call_later(
                 self._max_lifetime, self._on_entry_expired, entry)
 
-    def _new_entry(self, query, statement):
+    def _new_entry(
+        self,
+        query: _StatementCacheKey[_Record],
+        statement: '_cprotocol.PreparedStatementState[_Record]'
+    ) -> _StatementCacheEntry:
         entry = _StatementCacheEntry(self, query, statement)
         self._set_entry_timeout(entry)
         return entry
 
-    def _on_entry_expired(self, entry):
+    def _on_entry_expired(self, entry: _StatementCacheEntry) -> None:
         # `call_later` callback, called when an entry stayed longer
         # than `self._max_lifetime`.
         if self._entries.get(entry._query) is entry:
             self._entries.pop(entry._query)
             self._on_remove(entry._statement)
 
-    def _clear_entry_callback(self, entry):
+    def _clear_entry_callback(self, entry: _StatementCacheEntry) -> None:
         if entry._cleanup_cb is not None:
             entry._cleanup_cb.cancel()
 
-    def _maybe_cleanup(self):
+    def _maybe_cleanup(self) -> None:
         # Delete cache entries until the size of the cache is `max_size`.
         while len(self._entries) > self._max_size:
             old_query, old_entry = self._entries.popitem(last=False)
@@ -2153,20 +2974,20 @@ class _StatementCache:
 class _Atomic:
     __slots__ = ('_acquired',)
 
-    def __init__(self):
+    def __init__(self) -> None:
         self._acquired = 0
 
-    def __enter__(self):
+    def __enter__(self) -> None:
         if self._acquired:
             raise exceptions.InterfaceError(
                 'cannot perform operation: another operation is in progress')
         self._acquired = 1
 
-    def __exit__(self, t, e, tb):
+    def __exit__(self, t: typing.Any, e: typing.Any, tb: typing.Any) -> None:
         self._acquired = 0
 
 
-class _ConnectionProxy:
+class _ConnectionProxy(typing.Generic[_Record]):
     # Base class to enable `isinstance(Connection)` check.
     __slots__ = ()
 
@@ -2178,7 +2999,10 @@ ServerCapabilities = collections.namedtuple(
 ServerCapabilities.__doc__ = 'PostgreSQL server capabilities.'
 
 
-def _detect_server_capabilities(server_version, connection_settings):
+def _detect_server_capabilities(
+    server_version: 'types.ServerVersion',
+    connection_settings: '_cprotocol.ConnectionSettings'
+) -> ServerCapabilities:
     if hasattr(connection_settings, 'padb_revision'):
         # Amazon Redshift detected.
         advisory_locks = False
@@ -2217,28 +3041,28 @@ def _detect_server_capabilities(server_version, connection_settings):
     )
 
 
-def _extract_stack(limit=10):
+def _extract_stack(limit: int = 10) -> str:
     """Replacement for traceback.extract_stack() that only does the
     necessary work for asyncio debug mode.
     """
     frame = sys._getframe().f_back
     try:
         stack = traceback.StackSummary.extract(
-            traceback.walk_stack(frame), lookup_lines=False)
+            traceback.walk_stack(frame), lookup_lines=False)  # type: ignore[arg-type]  # noqa: E501
     finally:
         del frame
 
-    apg_path = asyncpg.__path__[0]
+    apg_path = asyncpg.__path__[0]  # type: ignore[attr-defined]
     i = 0
     while i < len(stack) and stack[i][0].startswith(apg_path):
         i += 1
-    stack = stack[i:i + limit]
+    stack = stack[i:i + limit]  # type: ignore[assignment]
 
     stack.reverse()
     return ''.join(traceback.format_list(stack))
 
 
-def _check_record_class(record_class):
+def _check_record_class(record_class: typing.Type[protocol.Record]) -> None:
     if record_class is protocol.Record:
         pass
     elif (

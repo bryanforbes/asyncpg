@@ -11,6 +11,8 @@ from .pool import create_pool, Pool  # NOQA
 from .protocol import Record  # NOQA
 from .types import *  # NOQA
 
+from . import exceptions
+
 
 from ._version import __version__  # NOQA
 

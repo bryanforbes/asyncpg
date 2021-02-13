@@ -6,58 +6,39 @@
 
 
 import asyncio
-import functools
-import os
 import pathlib
 import platform
 import sys
+import typing
 
-
-PY_36 = sys.version_info >= (3, 6)
-PY_37 = sys.version_info >= (3, 7)
-SYSTEM = platform.uname().system
-
-
-if sys.version_info < (3, 5, 2):
-    def aiter_compat(func):
-        @functools.wraps(func)
-        async def wrapper(self):
-            return func(self)
-        return wrapper
+if sys.version_info >= (3, 8):
+    from typing import (
+        Final as Final,
+        Literal as Literal,
+        Protocol as Protocol,
+        TypedDict as TypedDict
+    )
 else:
-    def aiter_compat(func):
-        return func
+    from typing_extensions import (  # noqa: F401
+        Final as Final,
+        Literal as Literal,
+        Protocol as Protocol,
+        TypedDict as TypedDict
+    )
 
 
-if PY_36:
-    fspath = os.fspath
-else:
-    def fspath(path):
-        fsp = getattr(path, '__fspath__', None)
-        if fsp is not None and callable(fsp):
-            path = fsp()
-            if not isinstance(path, (str, bytes)):
-                raise TypeError(
-                    'expected {}() to return str or bytes, not {}'.format(
-                        fsp.__qualname__, type(path).__name__
-                    ))
-            return path
-        elif isinstance(path, (str, bytes)):
-            return path
-        else:
-            raise TypeError(
-                'expected str, bytes or path-like object, not {}'.format(
-                    type(path).__name__
-                )
-            )
+_T = typing.TypeVar('_T')
+PY_36: Final = sys.version_info >= (3, 6)
+PY_37: Final = sys.version_info >= (3, 7)
+SYSTEM: Final = platform.uname().system
 
 
-if SYSTEM == 'Windows':
+if sys.platform == 'win32':
     import ctypes.wintypes
 
     CSIDL_APPDATA = 0x001a
 
-    def get_pg_home_directory() -> pathlib.Path:
+    def get_pg_home_directory() -> typing.Optional[pathlib.Path]:
         # We cannot simply use expanduser() as that returns the user's
         # home directory, whereas Postgres stores its config in
         # %AppData% on Windows.
@@ -67,25 +48,28 @@ if SYSTEM == 'Windows':
             return None
         else:
             return pathlib.Path(buf.value) / 'postgresql'
-
 else:
-    def get_pg_home_directory() -> pathlib.Path:
+    def get_pg_home_directory() -> typing.Optional[pathlib.Path]:
         return pathlib.Path.home()
 
 
-if PY_37:
-    def current_asyncio_task(loop):
+if sys.version_info >= (3, 7):
+    def current_asyncio_task(
+        loop: typing.Optional[asyncio.AbstractEventLoop]
+    ) -> typing.Optional['asyncio.Task[typing.Any]']:
         return asyncio.current_task(loop)
 else:
-    def current_asyncio_task(loop):
+    def current_asyncio_task(
+        loop: typing.Optional[asyncio.AbstractEventLoop]
+    ) -> typing.Optional['asyncio.Task[typing.Any]']:
         return asyncio.Task.current_task(loop)
 
 
-async def wait_closed(stream):
+async def wait_closed(stream: asyncio.StreamWriter) -> None:
     # Not all asyncio versions have StreamWriter.wait_closed().
     if hasattr(stream, 'wait_closed'):
         try:
-            await stream.wait_closed()
+            await typing.cast(typing.Any, stream).wait_closed()
         except ConnectionResetError:
             # On Windows wait_closed() sometimes propagates
             # ConnectionResetError which is totally unnecessary.
@@ -93,7 +77,7 @@ async def wait_closed(stream):
 
 
 # Workaround for https://bugs.python.org/issue37658
-async def wait_for(fut, timeout):
+async def wait_for(fut: 'asyncio.Future[_T]', timeout: float) -> _T:
     if timeout is None:
         return await fut
 

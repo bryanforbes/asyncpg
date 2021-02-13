@@ -9,7 +9,9 @@ import asyncio
 import functools
 import inspect
 import logging
+import sys
 import time
+import typing
 import warnings
 
 from . import compat
@@ -21,8 +23,10 @@ from . import protocol
 
 logger = logging.getLogger(__name__)
 
+_Record = typing.TypeVar('_Record', bound=protocol.Record)
 
-class PoolConnectionProxyMeta(type):
+
+class _PoolConnectionProxyMeta(type):
 
     def __new__(mcls, name, bases, dct, *, wrap=False):
         if wrap:
@@ -63,7 +67,16 @@ class PoolConnectionProxyMeta(type):
         return call_con_method
 
 
-class PoolConnectionProxy(connection._ConnectionProxy,
+if sys.version_info >= (3, 7):
+    PoolConnectionProxyMeta = _PoolConnectionProxyMeta
+else:
+    # see: https://github.com/python/typing/issues/449
+    class PoolConnectionProxyMeta(_PoolConnectionProxyMeta,
+                                  typing.GenericMeta):
+        ...
+
+
+class PoolConnectionProxy(connection._ConnectionProxy[_Record],
                           metaclass=PoolConnectionProxyMeta,
                           wrap=True):
 
@@ -96,7 +109,7 @@ class PoolConnectionProxy(connection._ConnectionProxy,
                 classname=self.__class__.__name__, con=self._con, id=id(self))
 
 
-class PoolConnectionHolder:
+class PoolConnectionHolder(typing.Generic[_Record]):
 
     __slots__ = ('_con', '_pool', '_loop', '_proxy',
                  '_max_queries', '_setup',
@@ -114,7 +127,7 @@ class PoolConnectionHolder:
         self._max_inactive_time = max_inactive_time
         self._setup = setup
         self._inactive_callback = None
-        self._in_use = None  # type: asyncio.Future
+        self._in_use: asyncio.Future = None
         self._timeout = None
         self._generation = None
 
@@ -295,7 +308,7 @@ class PoolConnectionHolder:
         self._pool._queue.put_nowait(self)
 
 
-class Pool:
+class Pool(typing.Generic[_Record]):
     """A connection pool.
 
     Connection pool can be used to manage a set of connections to the database.
@@ -431,7 +444,7 @@ class Pool:
             # Connect the first connection holder in the queue so that it
             # can record `_working_addr` and `_working_opts`, which will
             # speed up successive connection attempts.
-            first_ch = self._holders[-1]  # type: PoolConnectionHolder
+            first_ch: PoolConnectionHolder = self._holders[-1]
             await first_ch.connect()
 
             if self._minsize > 1:
@@ -605,9 +618,9 @@ class Pool:
 
     async def _acquire(self, timeout):
         async def _acquire_impl():
-            ch = await self._queue.get()  # type: PoolConnectionHolder
+            ch: PoolConnectionHolder = await self._queue.get()
             try:
-                proxy = await ch.acquire()  # type: PoolConnectionProxy
+                proxy: PoolConnectionProxy = await ch.acquire()
             except (Exception, asyncio.CancelledError):
                 self._queue.put_nowait(ch)
                 raise
@@ -769,7 +782,7 @@ class Pool:
         await self.close()
 
 
-class PoolAcquireContext:
+class PoolAcquireContext(typing.Generic[_Record]):
 
     __slots__ = ('timeout', 'connection', 'done', 'pool')
 

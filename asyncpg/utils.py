@@ -6,17 +6,23 @@
 
 
 import re
+import typing
+
+if typing.TYPE_CHECKING:
+    from .protocol import protocol as _cprotocol  # noqa: F401
+    from . import connection
 
 
-def _quote_ident(ident):
+def _quote_ident(ident: str) -> str:
     return '"{}"'.format(ident.replace('"', '""'))
 
 
-def _quote_literal(string):
+def _quote_literal(string: str) -> str:
     return "'{}'".format(string.replace("'", "''"))
 
 
-async def _mogrify(conn, query, args):
+async def _mogrify(conn: 'connection.Connection[typing.Any]',
+                   query: str, args: typing.Tuple[typing.Any, ...]) -> str:
     """Safely inline arguments to query text."""
     # Introspect the target query for argument types and
     # build a list of safely-quoted fully-qualified type names.
@@ -42,4 +48,5 @@ async def _mogrify(conn, query, args):
 
     # Finally, replace $n references with text values.
     return re.sub(
-        r'\$(\d+)\b', lambda m: textified[int(m.group(1)) - 1], query)
+        r'\$(\d+)\b', lambda m: typing.cast(str, typing.cast(
+            '_cprotocol.Record', textified)[int(m.group(1)) - 1]), query)

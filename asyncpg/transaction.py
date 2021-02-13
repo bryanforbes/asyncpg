@@ -6,9 +6,15 @@
 
 
 import enum
+import typing
 
+from . import compat
 from . import connresource
 from . import exceptions as apg_errors
+
+
+if typing.TYPE_CHECKING:
+    from . import connection as _connection
 
 
 class TransactionState(enum.Enum):
@@ -19,8 +25,19 @@ class TransactionState(enum.Enum):
     FAILED = 4
 
 
-ISOLATION_LEVELS = {'read_committed', 'serializable', 'repeatable_read'}
-ISOLATION_LEVELS_BY_VALUE = {
+IsolationLevels = compat.Literal['read_committed',
+                                 'serializable',
+                                 'repeatable_read']
+ISOLATION_LEVELS: compat.Final[
+    typing.Set[IsolationLevels]
+] = {
+    'read_committed',
+    'serializable',
+    'repeatable_read'
+}
+ISOLATION_LEVELS_BY_VALUE: compat.Final[
+    typing.Dict[str, IsolationLevels]
+] = {
     'read committed': 'read_committed',
     'serializable': 'serializable',
     'repeatable read': 'repeatable_read',
@@ -38,7 +55,9 @@ class Transaction(connresource.ConnectionResource):
     __slots__ = ('_connection', '_isolation', '_readonly', '_deferrable',
                  '_state', '_nested', '_id', '_managed')
 
-    def __init__(self, connection, isolation, readonly, deferrable):
+    def __init__(self, connection: '_connection.Connection[typing.Any]',
+                 isolation: typing.Optional[IsolationLevels],
+                 readonly: bool, deferrable: bool) -> None:
         super().__init__(connection)
 
         if isolation and isolation not in ISOLATION_LEVELS:
@@ -62,17 +81,19 @@ class Transaction(connresource.ConnectionResource):
         self._deferrable = deferrable
         self._state = TransactionState.NEW
         self._nested = False
-        self._id = None
+        self._id: typing.Optional[str] = None
         self._managed = False
 
-    async def __aenter__(self):
+    async def __aenter__(self) -> None:
         if self._managed:
             raise apg_errors.InterfaceError(
                 'cannot enter context: already in an `async with` block')
         self._managed = True
         await self.start()
 
-    async def __aexit__(self, extype, ex, tb):
+    async def __aexit__(self, extype: typing.Any,
+                        ex: typing.Any,
+                        tb: typing.Any) -> None:
         try:
             self._check_conn_validity('__aexit__')
         except apg_errors.InterfaceError:
@@ -98,7 +119,7 @@ class Transaction(connresource.ConnectionResource):
             self._managed = False
 
     @connresource.guarded
-    async def start(self):
+    async def start(self) -> None:
         """Enter the transaction or savepoint block."""
         self.__check_state_base('start')
         if self._state is TransactionState.STARTED:
@@ -154,7 +175,7 @@ class Transaction(connresource.ConnectionResource):
         else:
             self._state = TransactionState.STARTED
 
-    def __check_state_base(self, opname):
+    def __check_state_base(self, opname: str) -> None:
         if self._state is TransactionState.COMMITTED:
             raise apg_errors.InterfaceError(
                 'cannot {}; the transaction is already committed'.format(
@@ -168,7 +189,7 @@ class Transaction(connresource.ConnectionResource):
                 'cannot {}; the transaction is in error state'.format(
                     opname))
 
-    def __check_state(self, opname):
+    def __check_state(self, opname: str) -> None:
         if self._state is not TransactionState.STARTED:
             if self._state is TransactionState.NEW:
                 raise apg_errors.InterfaceError(
@@ -176,7 +197,7 @@ class Transaction(connresource.ConnectionResource):
                         opname))
             self.__check_state_base(opname)
 
-    async def __commit(self):
+    async def __commit(self) -> None:
         self.__check_state('commit')
 
         if self._connection._top_xact is self:
@@ -195,7 +216,7 @@ class Transaction(connresource.ConnectionResource):
         else:
             self._state = TransactionState.COMMITTED
 
-    async def __rollback(self):
+    async def __rollback(self) -> None:
         self.__check_state('rollback')
 
         if self._connection._top_xact is self:
@@ -215,7 +236,7 @@ class Transaction(connresource.ConnectionResource):
             self._state = TransactionState.ROLLEDBACK
 
     @connresource.guarded
-    async def commit(self):
+    async def commit(self) -> None:
         """Exit the transaction or savepoint block and commit changes."""
         if self._managed:
             raise apg_errors.InterfaceError(
@@ -223,18 +244,18 @@ class Transaction(connresource.ConnectionResource):
         await self.__commit()
 
     @connresource.guarded
-    async def rollback(self):
+    async def rollback(self) -> None:
         """Exit the transaction or savepoint block and rollback changes."""
         if self._managed:
             raise apg_errors.InterfaceError(
                 'cannot manually rollback from within an `async with` block')
         await self.__rollback()
 
-    def __repr__(self):
+    def __repr__(self) -> str:
         attrs = []
         attrs.append('state:{}'.format(self._state.name.lower()))
 
-        attrs.append(self._isolation)
+        attrs.append(str(self._isolation))
         if self._readonly:
             attrs.append('readonly')
         if self._deferrable:

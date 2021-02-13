@@ -4,11 +4,12 @@
 # This module is part of asyncpg and is released under
 # the Apache 2.0 License: http://www.apache.org/licenses/LICENSE-2.0
 
+import typing
 
 from . import types
 
 
-def split_server_version_string(version_string):
+def split_server_version_string(version_string: str) -> types.ServerVersion:
     version_string = version_string.strip()
     if version_string.startswith('PostgreSQL '):
         version_string = version_string[len('PostgreSQL '):]
@@ -19,7 +20,7 @@ def split_server_version_string(version_string):
     # into the numeric version string, so make sure to only look
     # at stuff before the first space.
     version_string = version_string.split(' ')[0]
-    parts = version_string.strip().split('.')
+    parts: typing.List[typing.Any] = version_string.strip().split('.')
     if not parts[-1].isdigit():
         # release level specified
         lastitem = parts[-1]
@@ -47,7 +48,7 @@ def split_server_version_string(version_string):
         # a major version check due to a bugfix release.
         parts.insert(1, 0)
 
-    versions = [int(p) for p in parts][:3]
+    versions: typing.List[typing.Any] = [int(p) for p in parts][:3]
     if len(versions) < 3:
         versions += [0] * (3 - len(versions))
 

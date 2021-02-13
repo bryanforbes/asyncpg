@@ -5,7 +5,7 @@
 # the Apache 2.0 License: http://www.apache.org/licenses/LICENSE-2.0
 
 
-import collections
+import typing
 
 from asyncpg.pgproto.types import (
     BitString, Point, Path, Polygon,
@@ -19,7 +19,13 @@ __all__ = (
 )
 
 
-Type = collections.namedtuple('Type', ['oid', 'name', 'kind', 'schema'])
+class Type(typing.NamedTuple):
+    oid: int
+    name: str
+    kind: str
+    schema: str
+
+
 Type.__doc__ = 'Database data type.'
 Type.oid.__doc__ = 'OID of the type.'
 Type.name.__doc__ = 'Type name.  For example "int2".'
@@ -28,25 +34,39 @@ Type.kind.__doc__ = \
 Type.schema.__doc__ = 'Name of the database schema that defines the type.'
 
 
-Attribute = collections.namedtuple('Attribute', ['name', 'type'])
+class Attribute(typing.NamedTuple):
+    name: str
+    type: Type
+
+
 Attribute.__doc__ = 'Database relation attribute.'
 Attribute.name.__doc__ = 'Attribute name.'
 Attribute.type.__doc__ = 'Attribute data type :class:`asyncpg.types.Type`.'
 
 
-ServerVersion = collections.namedtuple(
-    'ServerVersion', ['major', 'minor', 'micro', 'releaselevel', 'serial'])
+class ServerVersion(typing.NamedTuple):
+    major: int
+    minor: int
+    micro: int
+    releaselevel: str
+    serial: int
+
+
 ServerVersion.__doc__ = 'PostgreSQL server version tuple.'
 
+T = typing.TypeVar('T')
 
-class Range:
+
+class Range(typing.Generic[T]):
     """Immutable representation of PostgreSQL `range` type."""
 
     __slots__ = '_lower', '_upper', '_lower_inc', '_upper_inc', '_empty'
 
-    def __init__(self, lower=None, upper=None, *,
-                 lower_inc=True, upper_inc=False,
-                 empty=False):
+    def __init__(self, lower: typing.Optional[T] = None,
+                 upper: typing.Optional[T] = None, *,
+                 lower_inc: bool = True,
+                 upper_inc: bool = False,
+                 empty: bool = False) -> None:
         self._empty = empty
         if empty:
             self._lower = self._upper = None
@@ -58,37 +78,37 @@ class Range:
             self._upper_inc = upper is not None and upper_inc
 
     @property
-    def lower(self):
+    def lower(self) -> typing.Optional[T]:
         return self._lower
 
     @property
-    def lower_inc(self):
+    def lower_inc(self) -> bool:
         return self._lower_inc
 
     @property
-    def lower_inf(self):
+    def lower_inf(self) -> bool:
         return self._lower is None and not self._empty
 
     @property
-    def upper(self):
+    def upper(self) -> typing.Optional[T]:
         return self._upper
 
     @property
-    def upper_inc(self):
+    def upper_inc(self) -> bool:
         return self._upper_inc
 
     @property
-    def upper_inf(self):
+    def upper_inf(self) -> bool:
         return self._upper is None and not self._empty
 
     @property
-    def isempty(self):
+    def isempty(self) -> bool:
         return self._empty
 
-    def __bool__(self):
+    def __bool__(self) -> bool:
         return not self._empty
 
-    def __eq__(self, other):
+    def __eq__(self, other: object) -> bool:
         if not isinstance(other, Range):
             return NotImplemented
 
@@ -106,7 +126,7 @@ class Range:
             other._empty
         )
 
-    def __hash__(self):
+    def __hash__(self) -> int:
         return hash((
             self._lower,
             self._upper,
@@ -115,7 +135,7 @@ class Range:
             self._empty
         ))
 
-    def __repr__(self):
+    def __repr__(self) -> str:
         if self._empty:
             desc = 'empty'
         else:

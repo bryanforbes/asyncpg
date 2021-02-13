@@ -6,7 +6,6 @@
 
 
 import asyncio
-import collections
 import functools
 import getpass
 import os
@@ -27,37 +26,42 @@ from . import compat
 from . import exceptions
 from . import protocol
 
+_Connection = typing.TypeVar('_Connection')
+_Protocol = typing.TypeVar('_Protocol', bound=asyncio.Protocol)
+_Record = typing.TypeVar('_Record', bound=protocol.Record)
 
-_ConnectionParameters = collections.namedtuple(
-    'ConnectionParameters',
-    [
-        'user',
-        'password',
-        'database',
-        'ssl',
-        'ssl_is_advisory',
-        'connect_timeout',
-        'server_settings',
-    ])
-
-
-_ClientConfiguration = collections.namedtuple(
-    'ConnectionConfiguration',
-    [
-        'command_timeout',
-        'statement_cache_size',
-        'max_cached_statement_lifetime',
-        'max_cacheable_statement_size',
-    ])
+_TPTupleType = typing.Tuple[asyncio.WriteTransport, _Protocol]
+AddrType = typing.Union[typing.Tuple[str, int], str]
+SSLStringValues = compat.Literal[
+    'disable', 'prefer', 'allow', 'require', 'verify-ca', 'verify-full'
+]
+_ParsedSSLType = typing.Union[
+    ssl_module.SSLContext, compat.Literal[False]
+]
+SSLType = typing.Union[_ParsedSSLType, SSLStringValues, bool]
+HostType = typing.Union[typing.List[str], str]
+PortType = typing.Union[typing.List[int], int]
 
 
-_system = platform.uname().system
+class _ConnectionParameters(typing.NamedTuple):
+    user: str
+    password: typing.Optional[str]
+    database: str
+    ssl: typing.Optional[_ParsedSSLType]
+    ssl_is_advisory: typing.Optional[bool]
+    connect_timeout: typing.Optional[float]
+    server_settings: typing.Optional[typing.Dict[str, str]]
 
 
-if _system == 'Windows':
-    PGPASSFILE = 'pgpass.conf'
-else:
-    PGPASSFILE = '.pgpass'
+class _ClientConfiguration(typing.NamedTuple):
+    command_timeout: typing.Optional[float]
+    statement_cache_size: int
+    max_cached_statement_lifetime: int
+    max_cacheable_statement_size: int
+
+
+_system: compat.Final = platform.uname().system
+PGPASSFILE: compat.Final = 'pgpass.conf' if _system == 'Windows' else '.pgpass'
 
 
 def _read_password_file(passfile: pathlib.Path) \
@@ -104,11 +108,11 @@ def _read_password_file(passfile: pathlib.Path) \
 
 
 def _read_password_from_pgpass(
-        *, passfile: typing.Optional[pathlib.Path],
+        *, passfile: pathlib.Path,
         hosts: typing.List[str],
         ports: typing.List[int],
         database: str,
-        user: str):
+        user: str) -> typing.Optional[str]:
     """Parse the pgpass file and return the matching password.
 
     :return:
@@ -140,7 +144,9 @@ def _read_password_from_pgpass(
     return None
 
 
-def _validate_port_spec(hosts, port):
+def _validate_port_spec(hosts: typing.List[str],
+                        port: PortType) \
+        -> typing.List[int]:
     if isinstance(port, list):
         # If there is a list of ports, its length must
         # match that of the host list.
@@ -154,30 +160,35 @@ def _validate_port_spec(hosts, port):
     return port
 
 
-def _parse_hostlist(hostlist, port, *, unquote=False):
+def _parse_hostlist(hostlist: str,
+                    port: typing.Optional[PortType],
+                    *, unquote: bool = False) \
+        -> typing.Tuple[typing.List[str], typing.List[int]]:
     if ',' in hostlist:
         # A comma-separated list of host addresses.
         hostspecs = hostlist.split(',')
     else:
         hostspecs = [hostlist]
 
-    hosts = []
-    hostlist_ports = []
+    hosts: typing.List[str] = []
+    hostlist_ports: typing.List[int] = []
+    ports: typing.Optional[typing.List[int]] = None
 
     if not port:
         portspec = os.environ.get('PGPORT')
         if portspec:
             if ',' in portspec:
-                default_port = [int(p) for p in portspec.split(',')]
+                temp_port: typing.Union[typing.List[int], int] = [
+                    int(p) for p in portspec.split(',')]
             else:
-                default_port = int(portspec)
+                temp_port = int(portspec)
         else:
-            default_port = 5432
+            temp_port = 5432
 
-        default_port = _validate_port_spec(hostspecs, default_port)
+        default_port = _validate_port_spec(hostspecs, temp_port)
 
     else:
-        port = _validate_port_spec(hostspecs, port)
+        ports = _validate_port_spec(hostspecs, port)
 
     for i, hostspec in enumerate(hostspecs):
         if not hostspec.startswith('/'):
@@ -198,18 +209,28 @@ def _parse_hostlist(hostlist, port, *, unquote=False):
             else:
                 hostlist_ports.append(default_port[i])
 
-    if not port:
-        port = hostlist_ports
+    if not ports:
+        ports = hostlist_ports
 
-    return hosts, port
+    return hosts, ports
 
 
-def _parse_connect_dsn_and_args(*, dsn, host, port, user,
-                                password, passfile, database, ssl,
-                                connect_timeout, server_settings):
+def _parse_connect_dsn_and_args(*, dsn: typing.Optional[str],
+                                host: typing.Optional[HostType],
+                                port: typing.Optional[PortType],
+                                user: typing.Optional[str],
+                                password: typing.Optional[str],
+                                passfile: typing.Optional[str],
+                                database: typing.Optional[str],
+                                ssl: typing.Optional[SSLType],
+                                connect_timeout: typing.Optional[float],
+                                server_settings: typing.Dict[str, str]) \
+        -> typing.Tuple[typing.List[typing.Union[typing.Tuple[str, int], str]],
+                        _ConnectionParameters]:
     # `auth_hosts` is the version of host information for the purposes
     # of reading the pgpass file.
     auth_hosts = None
+    ssl_val: typing.Optional[typing.Union[SSLType, str]] = ssl
 
     if dsn:
         parsed = urllib.parse.urlparse(dsn)
@@ -250,55 +271,56 @@ def _parse_connect_dsn_and_args(*, dsn, host, port, user,
 
         if parsed.query:
             query = urllib.parse.parse_qs(parsed.query, strict_parsing=True)
+            query_str: typing.Dict[str, str] = {}
             for key, val in query.items():
                 if isinstance(val, list):
-                    query[key] = val[-1]
+                    query_str[key] = val[-1]
 
-            if 'port' in query:
-                val = query.pop('port')
+            if 'port' in query_str:
+                val_str = query_str.pop('port')
                 if not port and val:
-                    port = [int(p) for p in val.split(',')]
+                    port = [int(p) for p in val_str.split(',')]
 
-            if 'host' in query:
-                val = query.pop('host')
-                if not host and val:
-                    host, port = _parse_hostlist(val, port)
+            if 'host' in query_str:
+                val_str = query_str.pop('host')
+                if not host and val_str:
+                    host, port = _parse_hostlist(val_str, port)
 
-            if 'dbname' in query:
-                val = query.pop('dbname')
+            if 'dbname' in query_str:
+                val_str = query_str.pop('dbname')
                 if database is None:
-                    database = val
+                    database = val_str
 
-            if 'database' in query:
-                val = query.pop('database')
+            if 'database' in query_str:
+                val_str = query_str.pop('database')
                 if database is None:
-                    database = val
+                    database = val_str
 
-            if 'user' in query:
-                val = query.pop('user')
+            if 'user' in query_str:
+                val_str = query_str.pop('user')
                 if user is None:
-                    user = val
+                    user = val_str
 
-            if 'password' in query:
-                val = query.pop('password')
+            if 'password' in query_str:
+                val_str = query_str.pop('password')
                 if password is None:
-                    password = val
+                    password = val_str
 
-            if 'passfile' in query:
-                val = query.pop('passfile')
+            if 'passfile' in query_str:
+                val_str = query_str.pop('passfile')
                 if passfile is None:
-                    passfile = val
+                    passfile = val_str
 
-            if 'sslmode' in query:
-                val = query.pop('sslmode')
-                if ssl is None:
-                    ssl = val
+            if 'sslmode' in query_str:
+                val_str = query_str.pop('sslmode')
+                if ssl_val is None:
+                    ssl_val = val_str
 
-            if query:
+            if query_str:
                 if server_settings is None:
-                    server_settings = query
+                    server_settings = query_str
                 else:
-                    server_settings = {**query, **server_settings}
+                    server_settings = {**query_str, **server_settings}
 
     if not host:
         hostspec = os.environ.get('PGHOST')
@@ -367,19 +389,21 @@ def _parse_connect_dsn_and_args(*, dsn, host, port, user,
         if passfile is None:
             homedir = compat.get_pg_home_directory()
             if homedir:
-                passfile = homedir / PGPASSFILE
+                passfile_path: typing.Optional[
+                    pathlib.Path
+                ] = homedir / PGPASSFILE
             else:
-                passfile = None
+                passfile_path = None
         else:
-            passfile = pathlib.Path(passfile)
+            passfile_path = pathlib.Path(passfile)
 
-        if passfile is not None:
+        if passfile_path is not None:
             password = _read_password_from_pgpass(
                 hosts=auth_hosts, ports=port,
                 database=database, user=user,
-                passfile=passfile)
+                passfile=passfile_path)
 
-    addrs = []
+    addrs: typing.List[AddrType] = []
     have_tcp_addrs = False
     for h, p in zip(host, port):
         if h.startswith('/'):
@@ -396,15 +420,15 @@ def _parse_connect_dsn_and_args(*, dsn, host, port, user,
         raise ValueError(
             'could not determine the database address to connect to')
 
-    if ssl is None:
-        ssl = os.getenv('PGSSLMODE')
+    if ssl_val is None:
+        ssl_val = os.getenv('PGSSLMODE')
 
-    if ssl is None and have_tcp_addrs:
-        ssl = 'prefer'
+    if ssl_val is None and have_tcp_addrs:
+        ssl_val = 'prefer'
 
     # ssl_is_advisory is only allowed to come from the sslmode parameter.
     ssl_is_advisory = None
-    if isinstance(ssl, str):
+    if isinstance(ssl_val, str):
         SSLMODES = {
             'disable': 0,
             'allow': 1,
@@ -414,7 +438,7 @@ def _parse_connect_dsn_and_args(*, dsn, host, port, user,
             'verify-full': 5,
         }
         try:
-            sslmode = SSLMODES[ssl]
+            sslmode = SSLMODES[ssl_val]
         except KeyError:
             modes = ', '.join(SSLMODES.keys())
             raise exceptions.InterfaceError(
@@ -452,19 +476,31 @@ def _parse_connect_dsn_and_args(*, dsn, host, port, user,
             'a Dict[str, str]')
 
     params = _ConnectionParameters(
-        user=user, password=password, database=database, ssl=ssl,
+        user=user, password=password, database=database,
+        ssl=typing.cast(_ParsedSSLType, ssl),
         ssl_is_advisory=ssl_is_advisory, connect_timeout=connect_timeout,
         server_settings=server_settings)
 
     return addrs, params
 
 
-def _parse_connect_arguments(*, dsn, host, port, user, password, passfile,
-                             database, timeout, command_timeout,
-                             statement_cache_size,
-                             max_cached_statement_lifetime,
-                             max_cacheable_statement_size,
-                             ssl, server_settings):
+def _parse_connect_arguments(*, dsn: typing.Optional[str],
+                             host: typing.Optional[HostType],
+                             port: typing.Optional[PortType],
+                             user: typing.Optional[str],
+                             password: typing.Optional[str],
+                             passfile: typing.Optional[str],
+                             database: typing.Optional[str],
+                             timeout: typing.Optional[float],
+                             command_timeout: typing.Optional[
+                                 typing.Union[float, typing.SupportsFloat]],
+                             statement_cache_size: int,
+                             max_cached_statement_lifetime: int,
+                             max_cacheable_statement_size: int,
+                             ssl: typing.Optional[SSLType],
+                             server_settings: typing.Dict[str, str]) \
+        -> typing.Tuple[typing.List[AddrType], _ConnectionParameters,
+                        _ClientConfiguration]:
 
     local_vars = locals()
     for var_name in {'max_cacheable_statement_size',
@@ -505,14 +541,16 @@ def _parse_connect_arguments(*, dsn, host, port, user, password, passfile,
 
 
 class TLSUpgradeProto(asyncio.Protocol):
-    def __init__(self, loop, host, port, ssl_context, ssl_is_advisory):
+    def __init__(self, loop: typing.Optional[asyncio.AbstractEventLoop],
+                 host: str, port: int, ssl_context: ssl_module.SSLContext,
+                 ssl_is_advisory: typing.Optional[bool]) -> None:
         self.on_data = _create_future(loop)
         self.host = host
         self.port = port
         self.ssl_context = ssl_context
         self.ssl_is_advisory = ssl_is_advisory
 
-    def data_received(self, data):
+    def data_received(self, data: bytes) -> None:
         if data == b'S':
             self.on_data.set_result(True)
         elif (self.ssl_is_advisory and
@@ -531,20 +569,29 @@ class TLSUpgradeProto(asyncio.Protocol):
                     'rejected SSL upgrade'.format(
                         host=self.host, port=self.port)))
 
-    def connection_lost(self, exc):
+    def connection_lost(self, exc: typing.Optional[Exception]) -> None:
         if not self.on_data.done():
             if exc is None:
                 exc = ConnectionError('unexpected connection_lost() call')
             self.on_data.set_exception(exc)
 
 
-async def _create_ssl_connection(protocol_factory, host, port, *,
-                                 loop, ssl_context, ssl_is_advisory=False):
+async def _create_ssl_connection(
+    protocol_factory: typing.Callable[[], _Protocol],
+    host: str,
+    port: int,
+    *,
+    loop: asyncio.AbstractEventLoop,
+    ssl_context: ssl_module.SSLContext,
+    ssl_is_advisory: typing.Optional[bool] = False
+) -> _TPTupleType[_Protocol]:
 
-    tr, pr = await loop.create_connection(
-        lambda: TLSUpgradeProto(loop, host, port,
-                                ssl_context, ssl_is_advisory),
-        host, port)
+    tr, pr = typing.cast(
+        typing.Tuple[asyncio.WriteTransport, TLSUpgradeProto],
+        await loop.create_connection(
+            lambda: TLSUpgradeProto(loop, host, port,
+                                    ssl_context, ssl_is_advisory),
+            host, port))
 
     tr.write(struct.pack('!ll', 8, 80877103))  # SSLRequest message.
 
@@ -557,8 +604,12 @@ async def _create_ssl_connection(protocol_factory, host, port, *,
     if hasattr(loop, 'start_tls'):
         if do_ssl_upgrade:
             try:
-                new_tr = await loop.start_tls(
-                    tr, pr, ssl_context, server_hostname=host)
+                new_tr = typing.cast(
+                    asyncio.WriteTransport,
+                    await typing.cast(typing.Any, loop).start_tls(
+                        tr, pr,
+                        ssl_context,
+                        server_hostname=host))
             except (Exception, asyncio.CancelledError):
                 tr.close()
                 raise
@@ -584,7 +635,10 @@ async def _create_ssl_connection(protocol_factory, host, port, *,
         tr.close()
 
         try:
-            return await conn_factory(sock=sock)
+            return typing.cast(
+                typing.Tuple[asyncio.WriteTransport, _Protocol],
+                await conn_factory(sock=sock)
+            )
         except (Exception, asyncio.CancelledError):
             sock.close()
             raise
@@ -592,14 +646,14 @@ async def _create_ssl_connection(protocol_factory, host, port, *,
 
 async def _connect_addr(
     *,
-    addr,
-    loop,
-    timeout,
-    params,
-    config,
-    connection_class,
-    record_class
-):
+    addr: AddrType,
+    loop: asyncio.AbstractEventLoop,
+    timeout: float,
+    params: _ConnectionParameters,
+    config: _ClientConfiguration,
+    connection_class: typing.Type[_Connection],
+    record_class: typing.Type[_Record]
+) -> _Connection:
     assert loop is not None
 
     if timeout <= 0:
@@ -620,18 +674,25 @@ async def _connect_addr(
         addr, connected, params, record_class, loop)
 
     if isinstance(addr, str):
-        # UNIX socket
-        connector = loop.create_unix_connection(proto_factory, addr)
+        connector = typing.cast(
+            typing.Coroutine[typing.Any, None,
+                             _TPTupleType['protocol.Protocol[_Record]']],
+            loop.create_unix_connection(proto_factory, addr)
+        )
     elif params.ssl:
         connector = _create_ssl_connection(
-            proto_factory, *addr, loop=loop, ssl_context=params.ssl,
+            proto_factory, *addr, loop=loop,
+            ssl_context=params.ssl,
             ssl_is_advisory=params.ssl_is_advisory)
     else:
-        connector = loop.create_connection(proto_factory, *addr)
+        connector = typing.cast(
+            typing.Coroutine[typing.Any, None,
+                             _TPTupleType['protocol.Protocol[_Record]']],
+            loop.create_connection(proto_factory, *addr))
 
-    connector = asyncio.ensure_future(connector)
+    connector_future = asyncio.ensure_future(connector)
     before = time.monotonic()
-    tr, pr = await compat.wait_for(connector, timeout=timeout)
+    tr, pr = await compat.wait_for(connector_future, timeout=timeout)
     timeout -= time.monotonic() - before
 
     try:
@@ -642,18 +703,27 @@ async def _connect_addr(
         tr.close()
         raise
 
-    con = connection_class(pr, tr, loop, addr, config, params_input)
+    con = connection_class(  # type: ignore[call-arg]
+        pr, tr, loop, addr, config, params_input
+    )
     pr.set_connection(con)
     return con
 
 
-async def _connect(*, loop, timeout, connection_class, record_class, **kwargs):
+async def _connect(
+    *,
+    loop: typing.Optional[asyncio.AbstractEventLoop],
+    timeout: float,
+    connection_class: typing.Type[_Connection],
+    record_class: typing.Type[_Record],
+    **kwargs: typing.Any
+) -> _Connection:
     if loop is None:
         loop = asyncio.get_event_loop()
 
     addrs, params, config = _parse_connect_arguments(timeout=timeout, **kwargs)
 
-    last_error = None
+    last_error: typing.Optional[BaseException] = None
     addr = None
     for addr in addrs:
         before = time.monotonic()
@@ -674,23 +744,28 @@ async def _connect(*, loop, timeout, connection_class, record_class, **kwargs):
         finally:
             timeout -= time.monotonic() - before
 
+    assert last_error is not None
     raise last_error
 
 
-async def _cancel(*, loop, addr, params: _ConnectionParameters,
-                  backend_pid, backend_secret):
+async def _cancel(*, loop: asyncio.AbstractEventLoop,
+                  addr: typing.Union[typing.Tuple[str, int], str],
+                  params: _ConnectionParameters,
+                  backend_pid: int, backend_secret: str) -> None:
 
     class CancelProto(asyncio.Protocol):
 
-        def __init__(self):
+        def __init__(self) -> None:
             self.on_disconnect = _create_future(loop)
 
-        def connection_lost(self, exc):
+        def connection_lost(self, exc: typing.Optional[Exception]) -> None:
             if not self.on_disconnect.done():
                 self.on_disconnect.set_result(True)
 
     if isinstance(addr, str):
-        tr, pr = await loop.create_unix_connection(CancelProto, addr)
+        tr, pr = typing.cast(typing.Tuple[asyncio.WriteTransport, CancelProto],
+                             await loop.create_unix_connection(CancelProto,
+                                                               addr))
     else:
         if params.ssl:
             tr, pr = await _create_ssl_connection(
@@ -700,8 +775,9 @@ async def _cancel(*, loop, addr, params: _ConnectionParameters,
                 ssl_context=params.ssl,
                 ssl_is_advisory=params.ssl_is_advisory)
         else:
-            tr, pr = await loop.create_connection(
-                CancelProto, *addr)
+            tr, pr = typing.cast(
+                typing.Tuple[asyncio.WriteTransport, CancelProto],
+                await loop.create_connection(CancelProto, *addr))
             _set_nodelay(_get_socket(tr))
 
     # Pack a CancelRequest message
@@ -714,7 +790,7 @@ async def _cancel(*, loop, addr, params: _ConnectionParameters,
         tr.close()
 
 
-def _get_socket(transport):
+def _get_socket(transport: asyncio.BaseTransport) -> typing.Any:
     sock = transport.get_extra_info('socket')
     if sock is None:
         # Shouldn't happen with any asyncio-complaint event loop.
@@ -723,14 +799,17 @@ def _get_socket(transport):
     return sock
 
 
-def _set_nodelay(sock):
+def _set_nodelay(sock: typing.Any) -> None:
     if not hasattr(socket, 'AF_UNIX') or sock.family != socket.AF_UNIX:
         sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
 
 
-def _create_future(loop):
+def _create_future(loop: typing.Optional[asyncio.AbstractEventLoop]) \
+        -> 'asyncio.Future[typing.Any]':
     try:
-        create_future = loop.create_future
+        create_future = typing.cast(
+            asyncio.AbstractEventLoop, loop
+        ).create_future
     except AttributeError:
         return asyncio.Future(loop=loop)
     else:
