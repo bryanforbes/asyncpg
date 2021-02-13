@@ -34,6 +34,7 @@ TEST_DEPENDENCIES = [
     # (example breakage: https://gitlab.com/pycqa/flake8/issues/427)
     'pycodestyle~=2.6.0',
     'flake8~=3.8.2',
+    'flake8-pyi>=20.10.0',
     'uvloop~=0.14.0;platform_system!="Windows"',
     'mypy>=0.800'
 ]

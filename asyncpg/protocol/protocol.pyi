@@ -32,10 +32,11 @@ from ..types import Type, Attribute
 
 _NoTimeoutType = NewType('_NoTimeoutType', object)
 _TimeoutType = Union[float, None, _NoTimeoutType]
-_Record = TypeVar('_Record', bound='Record')
-_OtherRecord = TypeVar('_OtherRecord', bound='Record')
+_Record = TypeVar('_Record', bound=Record)
+_OtherRecord = TypeVar('_OtherRecord', bound=Record)
 _PreparedStatementState = TypeVar('_PreparedStatementState',
-                                  bound='PreparedStatementState[Any]')
+                                  bound=PreparedStatementState[Any])
+_T = TypeVar('_T')
 
 BUILTIN_TYPE_NAME_MAP: Final[Dict[str, int]]
 BUILTIN_TYPE_OID_MAP: Final[Dict[int, str]]
@@ -87,7 +88,7 @@ class PreparedStatementState(Generic[_Record]):
         self,
         name: str,
         query: str,
-        protocol: 'BaseProtocol[Any]',
+        protocol: BaseProtocol[Any],
         record_class: _TypingType[_Record],
         ignore_custom_codec: bool,
     ) -> None: ...
@@ -272,8 +273,6 @@ class DataCodecConfig:
     def __reduce__(self) -> Any: ...
 
 class Protocol(BaseProtocol[_Record], asyncio.protocols.Protocol): ...
-
-_T = TypeVar('_T')
 
 class Record:
     @overload

@@ -57,7 +57,7 @@ class PoolConnectionProxy(connection._ConnectionProxy[_Record],
         prefetch: typing.Optional[int] = ...,
         timeout: typing.Optional[float] = ...,
         record_class: None = ...
-    ) -> 'cursor.CursorFactory[_Record]': ...
+    ) -> cursor.CursorFactory[_Record]: ...
     @typing.overload
     def cursor(
         self,
@@ -66,7 +66,7 @@ class PoolConnectionProxy(connection._ConnectionProxy[_Record],
         prefetch: typing.Optional[int] = ...,
         timeout: typing.Optional[float] = ...,
         record_class: typing.Type[_OtherRecord]
-    ) -> 'cursor.CursorFactory[_OtherRecord]': ...
+    ) -> cursor.CursorFactory[_OtherRecord]: ...
     @typing.overload
     def cursor(
         self,
@@ -76,8 +76,8 @@ class PoolConnectionProxy(connection._ConnectionProxy[_Record],
         timeout: typing.Optional[float] = ...,
         record_class: typing.Optional[typing.Type[_OtherRecord]]
     ) -> typing.Union[
-        'cursor.CursorFactory[_Record]',
-        'cursor.CursorFactory[_OtherRecord]',
+        cursor.CursorFactory[_Record],
+        cursor.CursorFactory[_OtherRecord],
     ]: ...
     @typing.overload
     async def prepare(
