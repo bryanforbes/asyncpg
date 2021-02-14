@@ -2992,11 +2992,13 @@ class _ConnectionProxy(typing.Generic[_Record]):
     __slots__ = ()
 
 
-ServerCapabilities = collections.namedtuple(
-    'ServerCapabilities',
-    ['advisory_locks', 'notifications', 'plpgsql', 'sql_reset',
-     'sql_close_all'])
-ServerCapabilities.__doc__ = 'PostgreSQL server capabilities.'
+class ServerCapabilities(typing.NamedTuple):
+    'PostgreSQL server capabilities.'
+    advisory_locks: bool
+    notifications: bool
+    plpgsql: bool
+    sql_reset: bool
+    sql_close_all: bool
 
 
 def _detect_server_capabilities(
